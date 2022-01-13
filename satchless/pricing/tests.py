@@ -12,7 +12,7 @@ class PriceTest(TestCase):
         self.p3 = Price(30, currency='USD')
 
     def test_basics(self):
-        self.assert_(self.p1.has_value())
+        self.assertTrue(self.p1.has_value())
         self.assertEqual(self.p1.net, self.p1.gross)
 
     def test_adding_non_price_object_fails(self):
@@ -35,7 +35,7 @@ class PriceTest(TestCase):
 
     def test_nan(self):
         p = self.p1 * decimal.Decimal('NaN')
-        self.assert_(not p.has_value())
+        self.assertTrue(not p.has_value())
 
     def test_valid_addition(self):
         p = self.p1 + self.p2
@@ -46,7 +46,7 @@ class PriceTest(TestCase):
         self.assertRaises(ValueError, lambda: self.p1 + self.p3)
 
     def test_add_mismatch_tax_name(self):
-        self.assertEquals(
+        self.assertEqual(
             self.p1 + Price(10, currency='BTC', tax_name='other'),
             Price(20, currency='BTC')
         )
