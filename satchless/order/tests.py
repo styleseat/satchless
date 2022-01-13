@@ -93,7 +93,7 @@ class OrderTest(TestCase):
 
     def test_set_status(self):
         order = TestOrder.objects.create(currency='USD')
-        last_status_change = datetime.datetime.now() - datetime.timedelta(hours=10)
+        last_status_change = datetime.datetime.utcnow() - datetime.timedelta(hours=10)
         order.last_status_change = last_status_change
         order.save()
         with mock.patch.object(signals.order_status_changed, 'send'):
