@@ -4,7 +4,6 @@ import decimal
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
-from django.utils import timezone
 from django.utils.translation import ugettext_lazy as _
 import random
 
@@ -60,9 +59,9 @@ class Order(models.Model):
     # Do not set the status manually, use .set_status() instead.
     status = models.CharField(_('order status'), max_length=32,
                               choices=STATUS_CHOICES, default='checkout')
-    created = models.DateTimeField(default=timezone.now,
+    created = models.DateTimeField(default=datetime.datetime.now,
                                    editable=False, blank=True)
-    last_status_change = models.DateTimeField(default=timezone.now,
+    last_status_change = models.DateTimeField(default=datetime.datetime.now,
                                    editable=False, blank=True)
     user = models.ForeignKey(settings.AUTH_USER_MODEL, blank=True, null=True,
                              related_name='orders',
@@ -118,7 +117,7 @@ class Order(models.Model):
     def set_status(self, new_status, extra_fields=[]):
         old_status = self.status
         self.status = new_status
-        self.last_status_change = timezone.now()
+        self.last_status_change = datetime.datetime.now()
         self.save(update_fields=['status', 'last_status_change']+extra_fields)
         signals.order_status_changed.send(sender=type(self), instance=self,
                                           old_status=old_status)
