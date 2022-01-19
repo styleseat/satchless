@@ -25,8 +25,8 @@ CLASSIFIERS = [
 
 REQUIREMENTS = [
     'six',
-    'Django~=1.11.0',
-    'django-mptt~=0.9.0',
+    'Django>=1.11.0',
+    'django-mptt>=0.9.0',
 ]
 
 EXTRAS = {
