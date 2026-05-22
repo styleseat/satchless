@@ -9,7 +9,10 @@ CLASSIFIERS = [
     'Development Status :: 3 - Alpha',
     'Environment :: Web Environment',
     'Framework :: Django',
+    'Framework :: Django :: 2.2',
     'Framework :: Django :: 3.2',
+    'Framework :: Django :: 4.2',
+    'Framework :: Django :: 5.1',
     'Intended Audience :: Developers',
     'License :: OSI Approved :: BSD License',
     'Operating System :: OS Independent',
@@ -27,7 +30,7 @@ CLASSIFIERS = [
 ]
 
 REQUIREMENTS = [
-    'Django>=3.2',
+    'Django>=2.2',
     'django-mptt>=0.13.0',
 ]
 
