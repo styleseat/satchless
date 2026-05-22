@@ -1,5 +1,3 @@
-from __future__ import absolute_import
-from django.conf.urls import url
 from django.shortcuts import redirect
 from django.template.response import TemplateResponse
 from django.utils.decorators import method_decorator

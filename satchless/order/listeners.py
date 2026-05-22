@@ -1,4 +1,3 @@
-from __future__ import absolute_import
 from satchless.cart.signals import cart_content_changed
 
 def cart_content_changed_listener(sender, instance=None, **kwargs):

@@ -1,5 +1,3 @@
-import six
-
 class PaymentFailure(Exception):
     def __init__(self, error_message):
         super(PaymentFailure, self).__init__(error_message)
