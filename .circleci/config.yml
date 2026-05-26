@@ -114,7 +114,9 @@ commands:
             git fetch --tags --quiet || true
             LATEST=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -1 | sed 's/^v//')
             LATEST=${LATEST:-0.0.0}
-            IFS=. read -r MAJOR MINOR PATCH <<< "$LATEST"
+            MAJOR=$(echo "$LATEST" | cut -d. -f1)
+            MINOR=$(echo "$LATEST" | cut -d. -f2)
+            PATCH=$(echo "$LATEST" | cut -d. -f3)
             case "<< parameters.bump >>" in
               major) NEW="$((MAJOR + 1)).0.0" ;;
               minor) NEW="${MAJOR}.$((MINOR + 1)).0" ;;
@@ -138,7 +140,9 @@ jobs:
             git fetch --tags --quiet || true
             LATEST=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -1 | sed 's/^v//')
             LATEST=${LATEST:-0.0.0}
-            IFS=. read -r MAJOR MINOR PATCH <<< "$LATEST"
+            MAJOR=$(echo "$LATEST" | cut -d. -f1)
+            MINOR=$(echo "$LATEST" | cut -d. -f2)
+            PATCH=$(echo "$LATEST" | cut -d. -f3)
             NEXT_PATCH=$((PATCH + 1))
             SHORT_SHA=${CIRCLE_SHA1:0:12}
             VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}.dev0+${SHORT_SHA}"
