@@ -1,9 +1,14 @@
 #! /usr/bin/env python
+import os
 from setuptools import setup, find_packages
 
-# dynamic retrive version number from stachless.VERSION
-version_tuple = __import__('satchless').VERSION
-version = '.'.join([str(v) for v in version_tuple])
+# CI publishes wheels with computed versions (pre-release dev tags off branch
+# commits, real releases tagged from master). Honor the override so we don't
+# need to commit a VERSION bump for every build.
+version = os.environ.get('SATCHLESS_VERSION')
+if not version:
+    version_tuple = __import__('satchless').VERSION
+    version = '.'.join([str(v) for v in version_tuple])
 
 CLASSIFIERS = [
     'Development Status :: 3 - Alpha',

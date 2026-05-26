@@ -1,0 +1,232 @@
+version: 2.1
+
+# CircleCI pipeline for the styleseat/satchless fork.
+#
+# Two workflows:
+#
+#   pre-release  Runs on every commit on every branch (including master).
+#                Publishes <next-patch>.dev0+<short-sha> to the styleseat
+#                CodeArtifact pip repo so styleseat devs can pin to a
+#                specific satchless commit while iterating.
+#
+#   release      Runs only on master. Surfaces three manual approval gates
+#                (hold-patch / hold-minor / hold-major). Whichever you
+#                approve in the CircleCI UI computes the next semver bump
+#                off the latest v* git tag, publishes the real wheel to
+#                CodeArtifact, and pushes the matching annotated tag.
+#
+# Auth:
+#   CircleCI's OIDC token is exchanged for the existing
+#   `CircleCi` role in styleseat-bridge (account 796488253411).
+#   That role already has codeartifact_read_write attached, so no new
+#   IAM is required. See styleseat-bridge/infra/iam.tf.
+#
+# Version source of truth:
+#   setup.py reads $SATCHLESS_VERSION when set; falls back to
+#   satchless/__init__.py VERSION otherwise. Local `pip install -e .`
+#   and the wheel built here use that override, so we never have to
+#   commit a VERSION bump to ship a release.
+
+orbs:
+  aws-cli: circleci/aws-cli@5.1.2
+
+executors:
+  publisher:
+    docker:
+      - image: cimg/python:3.11
+    resource_class: small
+
+commands:
+  assume-codeartifact-role:
+    description: Exchange CircleCI OIDC token for short-lived AWS creds via the CircleCi role in styleseat-bridge
+    steps:
+      - run:
+          name: Assume CircleCi role in styleseat-bridge
+          command: |
+            set -e
+            CREDS=$(aws sts assume-role-with-web-identity \
+              --role-arn arn:aws:iam::796488253411:role/CircleCi \
+              --role-session-name "satchless-${CIRCLE_BUILD_NUM}" \
+              --web-identity-token "$CIRCLE_OIDC_TOKEN_V2" \
+              --duration-seconds 3600 \
+              --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]" \
+              --output text)
+            AK=$(echo "$CREDS" | awk '{print $1}')
+            SK=$(echo "$CREDS" | awk '{print $2}')
+            ST=$(echo "$CREDS" | awk '{print $3}')
+            {
+              echo "export AWS_ACCESS_KEY_ID=$AK"
+              echo "export AWS_SECRET_ACCESS_KEY=$SK"
+              echo "export AWS_SESSION_TOKEN=$ST"
+              echo "export AWS_DEFAULT_REGION=us-east-1"
+            } >> "$BASH_ENV"
+
+  configure-twine:
+    description: Fetch a 12h CodeArtifact token and configure twine env vars
+    steps:
+      - run:
+          name: Configure twine for CodeArtifact (styleseat/pip)
+          command: |
+            set -e
+            TOKEN=$(aws codeartifact get-authorization-token \
+              --domain styleseat \
+              --domain-owner 796488253411 \
+              --query authorizationToken \
+              --output text)
+            REPO_URL=$(aws codeartifact get-repository-endpoint \
+              --domain styleseat \
+              --domain-owner 796488253411 \
+              --repository pip \
+              --format pypi \
+              --query repositoryEndpoint \
+              --output text)
+            {
+              echo "export TWINE_USERNAME=aws"
+              echo "export TWINE_PASSWORD=$TOKEN"
+              echo "export TWINE_REPOSITORY_URL=$REPO_URL"
+            } >> "$BASH_ENV"
+
+  build-and-upload-wheel:
+    description: Build a wheel using $SATCHLESS_VERSION and upload it via twine
+    steps:
+      - run:
+          name: Build wheel
+          command: |
+            set -e
+            python -m pip install --upgrade --quiet build twine
+            python -m build --wheel
+            ls -la dist/
+      - run:
+          name: Upload wheel to CodeArtifact
+          command: twine upload --non-interactive dist/*.whl
+
+  compute-next-semver:
+    description: Read the latest v* tag and export $NEXT_VERSION bumped at the given level
+    parameters:
+      bump:
+        type: enum
+        enum: ["patch", "minor", "major"]
+    steps:
+      - run:
+          name: Compute next << parameters.bump >> version
+          command: |
+            set -e
+            git fetch --tags --quiet || true
+            LATEST=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -1 | sed 's/^v//')
+            LATEST=${LATEST:-0.0.0}
+            IFS=. read -r MAJOR MINOR PATCH <<< "$LATEST"
+            case "<< parameters.bump >>" in
+              major) NEW="$((MAJOR + 1)).0.0" ;;
+              minor) NEW="${MAJOR}.$((MINOR + 1)).0" ;;
+              patch) NEW="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+            esac
+            echo "Bumping $LATEST -> $NEW (<< parameters.bump >>)"
+            echo "export NEXT_VERSION=$NEW" >> "$BASH_ENV"
+
+jobs:
+  publish-prerelease:
+    executor: publisher
+    steps:
+      - checkout
+      - aws-cli/install
+      - assume-codeartifact-role
+      - configure-twine
+      - run:
+          name: Compute pre-release version (<next-patch>.dev0+<short-sha>)
+          command: |
+            set -e
+            git fetch --tags --quiet || true
+            LATEST=$(git tag --list 'v[0-9]*' --sort=-version:refname | head -1 | sed 's/^v//')
+            LATEST=${LATEST:-0.0.0}
+            IFS=. read -r MAJOR MINOR PATCH <<< "$LATEST"
+            NEXT_PATCH=$((PATCH + 1))
+            SHORT_SHA=${CIRCLE_SHA1:0:12}
+            VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}.dev0+${SHORT_SHA}"
+            echo "Pre-release version: $VERSION"
+            echo "export SATCHLESS_VERSION=$VERSION" >> "$BASH_ENV"
+      - build-and-upload-wheel
+
+  release:
+    parameters:
+      bump:
+        type: enum
+        enum: ["patch", "minor", "major"]
+    executor: publisher
+    steps:
+      - checkout
+      - aws-cli/install
+      - assume-codeartifact-role
+      - configure-twine
+      - compute-next-semver:
+          bump: << parameters.bump >>
+      - run:
+          name: Stage version for build
+          command: echo "export SATCHLESS_VERSION=$NEXT_VERSION" >> "$BASH_ENV"
+      - build-and-upload-wheel
+      - run:
+          name: Push annotated git tag
+          command: |
+            set -e
+            git config user.name "CircleCI"
+            git config user.email "engineering@styleseat.com"
+            TAG="v${NEXT_VERSION}"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG"
+
+workflows:
+  pre-release:
+    jobs:
+      - publish-prerelease:
+          # Run for every commit on every branch. Skip tag pushes — the
+          # release job below creates those, and we don't want to publish
+          # an extra .dev0+sha wheel from the tag itself.
+          filters:
+            tags:
+              ignore: /.*/
+
+  release:
+    jobs:
+      - hold-patch:
+          type: approval
+          filters:
+            branches:
+              only: master
+            tags:
+              ignore: /.*/
+      - release:
+          name: release-patch
+          bump: patch
+          requires: [hold-patch]
+          filters:
+            branches:
+              only: master
+
+      - hold-minor:
+          type: approval
+          filters:
+            branches:
+              only: master
+            tags:
+              ignore: /.*/
+      - release:
+          name: release-minor
+          bump: minor
+          requires: [hold-minor]
+          filters:
+            branches:
+              only: master
+
+      - hold-major:
+          type: approval
+          filters:
+            branches:
+              only: master
+            tags:
+              ignore: /.*/
+      - release:
+          name: release-major
+          bump: major
+          requires: [hold-major]
+          filters:
+            branches:
+              only: master
