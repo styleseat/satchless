@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
-from __future__ import absolute_import
 import datetime
 import mock
 from decimal import Decimal
 from django.db import models
 import os
-import six
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -85,7 +83,7 @@ class OrderTest(TestCase):
 
     def test_str(self):
         order = TestOrder.objects.create(currency='USD')
-        self.assertEqual(six.text_type(order), 'Order #%s' % order.pk)
+        self.assertEqual(str(order), 'Order #%s' % order.pk)
 
     def test_billing_full_name(self):
         order = TestOrder(billing_first_name='Ada', billing_last_name='Lovelace')

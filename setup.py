@@ -1,22 +1,33 @@
 #! /usr/bin/env python
-from __future__ import absolute_import
+import os
 from setuptools import setup, find_packages
 
-# dynamic retrive version number from stachless.VERSION
-version_tuple = __import__('satchless').VERSION
-version = '.'.join([str(v) for v in version_tuple])
+# CI publishes wheels with computed versions (pre-release dev tags off branch
+# commits, real releases tagged from master). Honor the override so we don't
+# need to commit a VERSION bump for every build.
+version = os.environ.get('SATCHLESS_VERSION')
+if not version:
+    version_tuple = __import__('satchless').VERSION
+    version = '.'.join([str(v) for v in version_tuple])
 
 CLASSIFIERS = [
     'Development Status :: 3 - Alpha',
     'Environment :: Web Environment',
     'Framework :: Django',
+    'Framework :: Django :: 2.2',
+    'Framework :: Django :: 3.2',
+    'Framework :: Django :: 4.2',
+    'Framework :: Django :: 5.1',
     'Intended Audience :: Developers',
     'License :: OSI Approved :: BSD License',
     'Operating System :: OS Independent',
     'Programming Language :: Python',
-    'Programming Language :: Python :: 2.5',
-    'Programming Language :: Python :: 2.6',
-    'Programming Language :: Python :: 2.7',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: 3.14',
     'Topic :: Internet :: WWW/HTTP',
     'Topic :: Internet :: WWW/HTTP :: Dynamic Content',
     'Topic :: Software Development :: Libraries :: Application Frameworks',
@@ -24,9 +35,8 @@ CLASSIFIERS = [
 ]
 
 REQUIREMENTS = [
-    'six',
-    'Django>=1.11.0',
-    'django-mptt>=0.9.0',
+    'Django>=2.2',
+    'django-mptt>=0.13.0',
 ]
 
 EXTRAS = {
@@ -57,5 +67,6 @@ setup(name='satchless',
       classifiers=CLASSIFIERS,
       install_requires=REQUIREMENTS,
       extras_require=EXTRAS,
+      python_requires='>=3.10',
       platforms=['any'],
       zip_safe=False)

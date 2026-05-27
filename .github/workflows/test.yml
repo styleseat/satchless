@@ -11,45 +11,57 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - python-version: '2.7'
-            django-version: '1.11'
-            requirements-file: requirements-test.py2.txt
-          - python-version: '3.7'
-            django-version: '1.11'
-            requirements-file: requirements-test.py3.txt
-          - python-version: '3.8'
-            django-version: '2.0'
-            requirements-file: requirements-test.py3.txt
+          # Django 2.2 on 3.10 is what styleseat currently runs in production
+          # (officially unsupported by Django 2.2 but works in practice).
+          # django-mptt support windows: 0.14 supports 2.2-4.1, 0.16 supports 3.2-5.1+.
+          - python-version: '3.10'
+            django-version: '2.2'
+            mptt-version: '0.14'
+          - python-version: '3.10'
+            django-version: '3.2'
+            mptt-version: '0.14'
             coverage: true
-          - python-version: '3.8'
-            django-version: '3.0'
-            requirements-file: requirements-test.py3.txt
+          - python-version: '3.11'
+            django-version: '3.2'
+            mptt-version: '0.16'
+          - python-version: '3.11'
+            django-version: '4.2'
+            mptt-version: '0.16'
+          - python-version: '3.12'
+            django-version: '4.2'
+            mptt-version: '0.16'
+          - python-version: '3.12'
+            django-version: '5.1'
+            mptt-version: '0.16'
+          - python-version: '3.13'
+            django-version: '5.1'
+            mptt-version: '0.16'
 
     steps:
       - name: Setup Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          architecture: x64
 
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
           submodules: recursive
 
       - name: Install dependencies & project
         run: |
-          pip install Django~=${{ matrix.django-version }}
-          pip install -r ${{ matrix.requirements-file }}
+          pip install "Django~=${{ matrix.django-version }}.0" "django-mptt~=${{ matrix.mptt-version }}.0"
+          pip install -r requirements-test.py3.txt
+          pip install -e .
 
       - name: Create test database
         run: python ${GITHUB_WORKSPACE}/satchless_test/manage.py migrate
 
       - name: Run tests with coverage
-        # Run tests and upload coverage stats to coveralls.io
         if: ${{ matrix.coverage }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -59,6 +71,5 @@ jobs:
           coveralls
 
       - name: Run tests
-        # Run tests without uploading coverage stats to coveralls.io
         if: ${{ ! matrix.coverage }}
         run: py.test
