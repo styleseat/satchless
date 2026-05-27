@@ -1,0 +1,66 @@
+# Code Review Workflow
+#
+# This workflow calls the reusable workflow from styleseat/.github
+# Updates to the reusable workflow automatically apply to this repo.
+#
+# Triggers:
+#   @styleseatbot       - primary trigger (stable channel, uses @v1 tag)
+#   @styleseatbot@pre   - pre-release channel (uses @pre tag, for testing latest changes)
+#   @claude             - legacy alias, still recognized
+#
+# See: https://github.com/styleseat/.github for documentation.
+
+name: Code Review
+
+on:
+  issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+  issues:
+    types: [opened, assigned, edited]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  detect-channel:
+    if: |
+      !endsWith(github.actor, '[bot]') &&
+      (
+        (github.event_name == 'issue_comment' && (contains(github.event.comment.body, '@claude') || contains(github.event.comment.body, '@styleseatbot'))) ||
+        (github.event_name == 'pull_request_review_comment' && (contains(github.event.comment.body, '@claude') || contains(github.event.comment.body, '@styleseatbot'))) ||
+        (github.event_name == 'pull_request_review' && (contains(github.event.review.body, '@claude') || contains(github.event.review.body, '@styleseatbot'))) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude') || contains(github.event.issue.body, '@styleseatbot') || contains(github.event.issue.title, '@styleseatbot')))
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.parse.outputs.channel }}
+    steps:
+      - name: Detect release channel
+        id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body || github.event.review.body || github.event.issue.body || '' }}
+        run: |
+          if [[ "$COMMENT_BODY" =~ @(claude|styleseatbot)@pre([^a-zA-Z0-9]|$) ]]; then
+            echo "channel=pre" >> "$GITHUB_OUTPUT"
+            echo "Detected pre-release channel"
+          else
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            echo "Using stable channel"
+          fi
+
+  review-stable:
+    needs: detect-channel
+    if: needs.detect-channel.outputs.channel == 'stable'
+    uses: styleseat/.github/.github/workflows/code-review-reusable.yml@v1
+    with:
+      resource_ref: v1
+    secrets: inherit
+
+  review-pre:
+    needs: detect-channel
+    if: needs.detect-channel.outputs.channel == 'pre'
+    uses: styleseat/.github/.github/workflows/code-review-reusable.yml@pre
+    with:
+      resource_ref: pre
+    secrets: inherit
