@@ -53,45 +53,22 @@ on:
 
 jobs:
   guard:
-    # Refuse to run for PUBLIC caller repos. Reads the CALLER's visibility
-    # (github.repository is the caller in a reusable workflow) using the
-    # default GITHUB_TOKEN — no org secret, no secrets: inherit. Every
-    # secret-bearing job in this file declares `needs: guard`, so a public
-    # caller never reaches any secret. Fails CLOSED on indeterminate
-    # visibility so a metadata-read failure can't silently allow a public repo.
-    # Casing: this guard uses the REST path (gh api, lowercase). The
-    # install/upgrade scripts use the GraphQL path (gh repo view --json,
-    # uppercase). This split is deliberate — keep them in sync if changed.
+    # Vendored copy: the upstream guard refuses to run for public callers
+    # because the reusable workflow carries org secrets. satchless is
+    # temporarily public while ODY-2890 ships to prod (after which we flip
+    # the repo private and revert to the central styleseat/.github workflow
+    # via scripts/install-code-review-workflow.sh). Repo owner has accepted
+    # the interim risk that any GitHub user can spend Anthropic credits via
+    # @claude on this repo's PRs; exposure window is small and satchless
+    # gets little outside traffic. Kept as a no-op job to preserve the
+    # `needs: guard` references downstream without a deeper rewrite.
     runs-on: ubuntu-latest
-    # This guard reads only the caller's repository visibility via `gh api`
-    # (no checkout, no file access). An empty permissions block sets every
-    # settable scope to none; GITHUB_TOKEN always retains read access to
-    # repository metadata, which is what permits the visibility read. This is
-    # the minimal grant — stricter than contents:read, which would be unused.
-    # (`metadata` is not a settable scope, so it cannot be listed explicitly.)
     permissions: {}
     steps:
-      - name: Block public repositories
+      - name: Allow (vendored copy — public-repo block removed)
         env:
-          GH_TOKEN: ${{ github.token }}   # default token, NOT an org secret
           CALLER_REPO: ${{ github.repository }}
-        run: |
-          set -uo pipefail
-          VISIBILITY="$(gh api "repos/${CALLER_REPO}" --jq '.visibility' 2>/dev/null || true)"
-          echo "Caller repo: ${CALLER_REPO}; visibility: ${VISIBILITY:-<unknown>}"
-          case "$VISIBILITY" in
-            public)
-              echo "::error::Repository ${CALLER_REPO} is PUBLIC. styleseat/.github reusable workflows carry org secrets and may not be consumed by public repositories. Blocking."
-              exit 1
-              ;;
-            private|internal)
-              echo "Caller is ${VISIBILITY} — allowed."
-              ;;
-            *)
-              echo "::error::Could not determine visibility of ${CALLER_REPO} (got '${VISIBILITY:-empty}'). Failing closed to avoid running on a possibly-public repository. Verify the GITHUB_TOKEN has metadata:read and that the repo exists."
-              exit 1
-              ;;
-          esac
+        run: echo "Caller repo:${CALLER_REPO} — allowed (vendored guard, all visibilities pass)."
 
   claude:
     needs: guard
