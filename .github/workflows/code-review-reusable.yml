@@ -1,0 +1,2104 @@
+# Code Review Reusable Workflow
+#
+# Multi-phase code review workflow with progress tracking
+# Each phase is a separate LLM invocation with artifacts passed between phases
+#
+# Architecture:
+# - Detection: Bash script determines review vs assistance request
+# - Review Path: 5 LLM invocations (Plan → Context → Review → Verify → Post) with progress updates
+# - Assistance Path: Single LLM invocation for quick help
+#
+# Other repos can call this with `uses: styleseat/.github/.github/workflows/code-review-reusable.yml@v1`
+#
+# A backward-compat shim at .github/workflows/claude-reusable.yml forwards to this file
+# so legacy consumers pinned to the old path continue to work.
+
+name: Code Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: 'Claude model to use (opus or sonnet). Defaults to opus. Uses undated aliases (claude-opus-4-6, claude-sonnet-4-6) for automatic updates. When opus is selected, only planning and review phases use Opus; other phases use Sonnet for cost savings.'
+        required: false
+        default: 'opus'
+        # Note: workflow_call doesn't support type: choice, so we use string.
+        # Invalid values are handled gracefully in resolve_model step (defaults to opus).
+        type: string
+      resource_ref:
+        description: 'Git ref for prompts/templates from styleseat/.github (v1=stable, pre=pre-release). Set by consumer workflow.'
+        required: false
+        default: 'v1'
+        type: string
+      provider:
+        description: 'LLM provider (claude, openai, gemini). Default: claude.'
+        required: false
+        default: 'claude'
+        type: string
+      ab_enabled:
+        description: 'Enable A/B testing across providers. Default: false.'
+        required: false
+        default: 'false'
+        type: string
+      ab_providers:
+        description: 'Comma-separated providers for A/B testing (e.g., claude,openai). Default: claude,openai.'
+        required: false
+        default: 'claude,openai'
+        type: string
+      ab_weights:
+        description: 'Comma-separated weights matching ab_providers (e.g., 50,50). Default: 50,50.'
+        required: false
+        default: '50,50'
+        type: string
+
+jobs:
+  guard:
+    # Refuse to run for PUBLIC caller repos. Reads the CALLER's visibility
+    # (github.repository is the caller in a reusable workflow) using the
+    # default GITHUB_TOKEN — no org secret, no secrets: inherit. Every
+    # secret-bearing job in this file declares `needs: guard`, so a public
+    # caller never reaches any secret. Fails CLOSED on indeterminate
+    # visibility so a metadata-read failure can't silently allow a public repo.
+    # Casing: this guard uses the REST path (gh api, lowercase). The
+    # install/upgrade scripts use the GraphQL path (gh repo view --json,
+    # uppercase). This split is deliberate — keep them in sync if changed.
+    runs-on: ubuntu-latest
+    # This guard reads only the caller's repository visibility via `gh api`
+    # (no checkout, no file access). An empty permissions block sets every
+    # settable scope to none; GITHUB_TOKEN always retains read access to
+    # repository metadata, which is what permits the visibility read. This is
+    # the minimal grant — stricter than contents:read, which would be unused.
+    # (`metadata` is not a settable scope, so it cannot be listed explicitly.)
+    permissions: {}
+    steps:
+      - name: Block public repositories
+        env:
+          GH_TOKEN: ${{ github.token }}   # default token, NOT an org secret
+          CALLER_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          VISIBILITY="$(gh api "repos/${CALLER_REPO}" --jq '.visibility' 2>/dev/null || true)"
+          echo "Caller repo: ${CALLER_REPO}; visibility: ${VISIBILITY:-<unknown>}"
+          case "$VISIBILITY" in
+            public)
+              echo "::error::Repository ${CALLER_REPO} is PUBLIC. styleseat/.github reusable workflows carry org secrets and may not be consumed by public repositories. Blocking."
+              exit 1
+              ;;
+            private|internal)
+              echo "Caller is ${VISIBILITY} — allowed."
+              ;;
+            *)
+              echo "::error::Could not determine visibility of ${CALLER_REPO} (got '${VISIBILITY:-empty}'). Failing closed to avoid running on a possibly-public repository. Verify the GITHUB_TOKEN has metadata:read and that the repo exists."
+              exit 1
+              ;;
+          esac
+
+  claude:
+    needs: guard
+    runs-on: ubuntu-latest
+    # Concurrency group ensures only one workflow runs per PR at a time.
+    # cancel-in-progress: false means we wait for the current run to finish.
+    #
+    # Note: this key was renamed from `claude-pr-` during the rebrand. During the
+    # cutover, the explicit check_runs step below also matches the legacy
+    # "Claude Code" workflow name, so any in-flight runs from before the rename
+    # will still be detected and deduped even though they're in a different
+    # concurrency group.
+    concurrency:
+      group: code-review-pr-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    # Default GITHUB_TOKEN is read-only — all writes use the styleseatbot app token
+    # (see app_token step). This lets consumer repos with default_workflow_permissions=read
+    # consume the workflow without elevation.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: read
+
+    env:
+      CLAUDE_ARTIFACTS_DIR: /tmp/claude
+      # Trigger patterns - matches @claude, @styleseatbot (case-insensitive)
+      # TRIGGER_PATTERN is for bash regex, TRIGGER_PATTERN_JQ is for jq test()
+      TRIGGER_PATTERN: '@(claude|styleseatbot)'
+      TRIGGER_PATTERN_JQ: '@(claude|styleseatbot)'
+
+      # ========================================
+      # PER-PHASE THINKING EFFORT LEVELS
+      # Controls how many tokens Claude spends reasoning per phase.
+      # Set via CLAUDE_CODE_EFFORT_LEVEL env var on each Claude Code step.
+      # Levels: low | medium | high (default) | max (Opus 4.6 only)
+      # Docs: https://platform.claude.com/docs/en/build-with-claude/effort
+      # ========================================
+      CLASSIFIER_EFFORT: medium    # 2-word classification output; needs reasoning headroom to weigh @mention vs body content
+      PHASE1_EFFORT: medium        # Strategic review planning; structured output with some reasoning
+      PHASE2_EFFORT: low           # Data gathering and context assembly; checklist execution
+      PHASE3_EFFORT: max           # Core value: deep code analysis; "leash off" for thoroughness (Opus only; capped to "high" on Sonnet)
+      PHASE4_EFFORT: medium        # Fact-checking existing claims; verification not generation
+      PHASE5_EFFORT: low           # Mechanical GitHub API posting; follow instructions precisely
+      ENGAGEMENT_EFFORT: medium    # Contextual thread replies; needs judgment but not deep analysis
+      ASSISTANCE_EFFORT: medium    # Quick help and code changes; balanced speed and quality
+
+    # ========================================
+    # SKIP BEHAVIOR:
+    # If check_runs.outputs.skip == 'true', the workflow exits early.
+    # Steps after detect_type depend on its outputs (request_type == 'review' or 'assistance').
+    # Since detect_type won't run when skipped, those outputs are empty, causing all
+    # subsequent steps to naturally skip. This is intentional cascading behavior.
+    # ========================================
+
+    steps:
+      # ========================================
+      # GITHUB APP TOKEN: Generate installation token for styleseatbot identity
+      # Runs first (unconditionally) so eyes reaction posts as styleseatbot
+      # and cross-repo checkout can access styleseat/.github templates
+      # ========================================
+      - name: Generate GitHub App token
+        id: app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.STYLESEATBOT_APP_ID }}
+          private-key: ${{ secrets.STYLESEATBOT_APP_PRIVATE_KEY }}
+          owner: styleseat
+
+      # ========================================
+      # FETCH CLAUDE RESOURCES: Clone .github repo for templates and prompts
+      # Clones to /tmp so main repo checkout doesn't delete it
+      # Uses resource_ref input for version pinning (default: v1)
+      # ========================================
+      - name: Fetch claude resources
+        id: fetch_resources
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ github.event.comment.body || github.event.review.body || github.event.issue.body || github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          RESOURCES_DIR="/tmp/claude-resources"
+          mkdir -p "$RESOURCES_DIR"
+
+          RESOURCE_REF="${{ inputs.resource_ref }}"
+
+          # Parse @ref suffix from comment (e.g., @styleseatbot@pre, @claude@v1.14.0)
+          # Override RESOURCE_REF if a ref is specified in the comment
+          if [[ "$COMMENT_BODY" =~ @(claude|styleseatbot)@([a-zA-Z0-9._/-]+) ]]; then
+            RESOURCE_REF="${BASH_REMATCH[2]}"
+            echo "Overriding resource ref from comment: $RESOURCE_REF"
+          fi
+          echo "Using resource ref: $RESOURCE_REF"
+
+          # Strip @ref suffix from comment body for clean downstream processing
+          COMMENT_BODY=$(echo "$COMMENT_BODY" | sed -E 's/@(claude|styleseatbot)@[a-zA-Z0-9._/-]+/@\1/g')
+
+          # After stripping @ref suffix, ensure bare mentions are treated as review requests
+          CLEAN_BODY=$(printf '%s' "$COMMENT_BODY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          if [[ "$CLEAN_BODY" =~ ^@(claude|styleseatbot)$ ]]; then
+            COMMENT_BODY="$CLEAN_BODY review this PR"
+          fi
+
+          AUTH_TOKEN="${APP_TOKEN:-$GH_TOKEN}"
+
+          echo "Fetching claude resources from styleseat/.github at ref: $RESOURCE_REF"
+          if ! git clone --depth 1 --branch "$RESOURCE_REF" \
+              "https://x-access-token:${AUTH_TOKEN}@github.com/styleseat/.github.git" \
+              "$RESOURCES_DIR" 2>&1; then
+            echo "::error::Failed to clone styleseat/.github at ref '$RESOURCE_REF'"
+            echo "::error::GitHub App not configured. Claude code reviewer requires a GitHub App for cross-repo access."
+            echo "::error::See: https://github.com/styleseat/.github/blob/main/scripts/setup-github-app.sh"
+            exit 1
+          fi
+
+          # Output all step outputs
+          HEREDOC_DELIM="COMMENT_BODY_EOF_$(openssl rand -hex 8)"
+          {
+            echo "resources_dir=$RESOURCES_DIR"
+            echo "resource_ref=$RESOURCE_REF"
+            echo "comment_body<<${HEREDOC_DELIM}"
+            echo "$COMMENT_BODY"
+            echo "${HEREDOC_DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install jinja2-cli
+        run: |
+          uv tool install jinja2-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install Claude Code CLI
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install styleseatbot
+        id: install_styleseatbot
+        # Supply chain: deps version-pinned in pyproject.toml; --only-binary
+        # prevents arbitrary build-time code execution from remote deps.
+        run: pip install --only-binary ':all:' "${{ steps.fetch_resources.outputs.resources_dir }}"
+
+      # ========================================
+      # IMMEDIATE FEEDBACK: React with eyes emoji before any delay
+      # ========================================
+      - name: React with eyes emoji
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REVIEW_ID: ${{ github.event.review.id }}
+        run: |
+          # Add eyes reaction to the triggering comment for immediate feedback
+          # This lets users know the bot noticed their request
+          if [[ "$EVENT_NAME" == "issue_comment" || "$EVENT_NAME" == "pull_request_review_comment" ]]; then
+            if [[ -n "$COMMENT_ID" ]]; then
+              gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}/reactions" \
+                -X POST -f content="eyes" || echo "::warning::Failed to add eyes reaction"
+            fi
+          elif [[ "$EVENT_NAME" == "pull_request_review" ]]; then
+            if [[ -n "$REVIEW_ID" ]]; then
+              gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews/${REVIEW_ID}/reactions" \
+                -X POST -f content="eyes" || echo "::warning::Failed to add eyes reaction to review"
+            fi
+          fi
+
+      # ========================================
+      # INTENT CLASSIFICATION: Use Claude to classify comment intent
+      # ========================================
+      - name: Classify comment intent
+        id: classify_intent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          COMMENT_BODY: ${{ steps.fetch_resources.outputs.comment_body || github.event.comment.body || github.event.review.body || github.event.issue.body || github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+
+          # Prevent recursion: Ignore if comment author is the bot itself
+          ACTOR="${{ github.actor }}"
+          if [[ "$ACTOR" == "styleseatbot[bot]" ]] || [[ "$ACTOR" == "github-actions[bot]" ]]; then
+            echo "Detected bot comment (actor=$ACTOR). Ignoring to prevent recursion."
+            echo "request_type=ignore" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ========================================
+          # CONTEXT FLAGS DETECTION
+          # ========================================
+
+          # IS_CODE_THREAD: true if this is a review comment on a specific code line
+          if [[ "$EVENT_NAME" == "pull_request_review_comment" ]]; then
+            IS_CODE_THREAD="true"
+          else
+            IS_CODE_THREAD="false"
+          fi
+          echo "IS_CODE_THREAD=$IS_CODE_THREAD"
+
+          # Export for later steps
+          {
+            echo "is_code_thread=$IS_CODE_THREAD"
+          } >> "$GITHUB_OUTPUT"
+
+          # Gather PR metadata for classification
+          PR_TITLE=""
+          PR_DESCRIPTION=""
+          LINES_ADDED="0"
+          LINES_DELETED="0"
+          FILE_COUNT="0"
+          FILE_LIST=""
+
+          if [[ -n "$PR_NUMBER" ]]; then
+            echo "Gathering PR metadata for #${PR_NUMBER} in ${REPO}..."
+            PR_DATA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json title,body,additions,deletions,files 2>/dev/null || echo "{}")
+            PR_TITLE=$(echo "$PR_DATA" | jq -r '.title // ""')
+            PR_DESCRIPTION=$(echo "$PR_DATA" | jq -r '(.body // "")[:1000]')
+            LINES_ADDED=$(echo "$PR_DATA" | jq -r '.additions // 0')
+            LINES_DELETED=$(echo "$PR_DATA" | jq -r '.deletions // 0')
+            FILE_COUNT=$(echo "$PR_DATA" | jq -r '(.files // []) | length')
+            FILE_LIST=$(echo "$PR_DATA" | jq -r '[(.files // [])[:50][].path] | join("\n")')
+          fi
+
+          # Fetch the classification prompt from the repo (requires APP_TOKEN for cross-repo access)
+          echo "Fetching classification prompt..."
+          PROMPT_FILE=$(GH_TOKEN="$APP_TOKEN" gh api repos/styleseat/.github/contents/prompts/code-review/classify-intent.md \
+            --jq '.content' | base64 -d) || {
+            echo "::error::Failed to fetch classify-intent.md prompt"
+            echo "request_type=review" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # Escape user-controlled variables for safe Bash parameter expansion
+          # (escape / and & to prevent substitution breakout)
+          SAFE_COMMENT_BODY=$(printf '%s' "$COMMENT_BODY" | sed 's/[\/&]/\\&/g')
+          SAFE_PR_TITLE=$(printf '%s' "$PR_TITLE" | sed 's/[\/&]/\\&/g')
+          SAFE_PR_DESCRIPTION=$(printf '%s' "${PR_DESCRIPTION:0:500}" | sed 's/[\/&]/\\&/g')
+
+          # Substitute all placeholders using Bash parameter expansion
+          PROMPT="$PROMPT_FILE"
+          PROMPT="${PROMPT//\{\{COMMENT_BODY\}\}/$SAFE_COMMENT_BODY}"
+          PROMPT="${PROMPT//\{\{PR_TITLE\}\}/$SAFE_PR_TITLE}"
+          PROMPT="${PROMPT//\{\{PR_DESCRIPTION\}\}/$SAFE_PR_DESCRIPTION}"
+          PROMPT="${PROMPT//\{\{LINES_ADDED\}\}/$LINES_ADDED}"
+          PROMPT="${PROMPT//\{\{LINES_DELETED\}\}/$LINES_DELETED}"
+          PROMPT="${PROMPT//\{\{FILE_COUNT\}\}/$FILE_COUNT}"
+          PROMPT="${PROMPT//\{\{FILE_LIST\}\}/$FILE_LIST}"
+          PROMPT="${PROMPT//\{\{IS_CODE_THREAD\}\}/$IS_CODE_THREAD}"
+
+          # Escape for JSON
+          PROMPT_JSON=$(echo "$PROMPT" | jq -Rs .)
+
+          # Classifier always uses Sonnet: 2-word output needs minimal reasoning.
+          # Effort level from CLASSIFIER_EFFORT env var (default: medium).
+          # Bumped from `low` after a re-review tag with a status-update body
+          # was misclassified as IGNORE — `low` lacked the reasoning headroom
+          # to weigh the @mention opener against the body content.
+          CLASSIFIER_MODEL_ID="claude-sonnet-4-6"
+          CLASSIFIER_EFFORT_LEVEL="${CLASSIFIER_EFFORT:-medium}"
+          echo "::notice::Classifier using model: $CLASSIFIER_MODEL_ID (effort: $CLASSIFIER_EFFORT_LEVEL)"
+
+          # Call Claude API for classification
+          # Note: Direct API calls use output_config.effort (Anthropic Messages API parameter).
+          # Claude Code Action steps use CLAUDE_CODE_EFFORT_LEVEL env var instead (CLI parameter).
+          # Both control the same behavior; different interfaces for the same setting.
+          # Ref: https://platform.claude.com/docs/en/build-with-claude/effort
+          RESPONSE=$(curl -s -X POST "https://api.anthropic.com/v1/messages" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "{
+              \"model\": \"$CLASSIFIER_MODEL_ID\",
+              \"max_tokens\": 20,
+              \"output_config\": {\"effort\": \"$CLASSIFIER_EFFORT_LEVEL\"},
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": $PROMPT_JSON
+              }]
+            }")
+
+          # Extract the classification from response - now two words: TYPE MODEL
+          RAW_RESPONSE=$(echo "$RESPONSE" | jq -r '.content[0].text // "IGNORE DEFAULT"' | tr '[:lower:]' '[:upper:]' | tr -s '[:space:]' ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          echo "Raw classification response: $RAW_RESPONSE"
+
+          # Parse the two words
+          CLASSIFICATION=$(echo "$RAW_RESPONSE" | awk '{print $1}')
+          MODEL_FROM_LLM=$(echo "$RAW_RESPONSE" | awk '{print $2}')
+
+          # --- Classifier failover ---
+          if [[ -z "$CLASSIFICATION" ]] || [[ "$CLASSIFICATION" == "null" ]] || [[ "$CLASSIFICATION" == "IGNORE" && "$RAW_RESPONSE" == "IGNORE DEFAULT" ]]; then
+            # Check if Claude actually returned a valid response or if it failed
+            CLAUDE_ERROR=$(echo "$RESPONSE" | jq -r '.error.message // ""')
+            if [[ -n "$CLAUDE_ERROR" ]] || [[ -z "$CLASSIFICATION" ]] || [[ "$CLASSIFICATION" == "null" ]]; then
+              echo "::warning::Claude classifier returned empty/null/error response: ${CLAUDE_ERROR:-no content}"
+
+              # Try OpenAI
+              if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+                echo "::notice::Trying OpenAI classifier"
+                RESPONSE=$(curl -s -X POST "https://api.openai.com/v1/chat/completions" \
+                  -H "Content-Type: application/json" \
+                  -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+                  -d "{
+                    \"model\": \"gpt-4.1-mini\",
+                    \"max_tokens\": 20,
+                    \"messages\": [{\"role\": \"user\", \"content\": $PROMPT_JSON}]
+                  }")
+                RAW_RESPONSE=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // ""' | tr '[:lower:]' '[:upper:]' | tr -s '[:space:]' ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                CLASSIFICATION=$(echo "$RAW_RESPONSE" | awk '{print $1}')
+                MODEL_FROM_LLM=$(echo "$RAW_RESPONSE" | awk '{print $2}')
+                if [[ -n "$CLASSIFICATION" ]] && [[ "$CLASSIFICATION" != "null" ]]; then
+                  echo "::notice::OpenAI classifier succeeded: $CLASSIFICATION"
+                fi
+              fi
+            fi
+          fi
+
+          if [[ -z "$CLASSIFICATION" ]] || [[ "$CLASSIFICATION" == "null" ]]; then
+            # Try Gemini
+            if [[ -n "${GOOGLE_AI_API_KEY:-}" ]]; then
+              echo "::notice::Trying Gemini classifier"
+              RESPONSE=$(curl -s -X POST \
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GOOGLE_AI_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"contents\": [{\"parts\": [{\"text\": $(echo "$PROMPT_JSON" | jq -r .)}]}],
+                  \"generationConfig\": {\"maxOutputTokens\": 20}
+                }")
+              RAW_RESPONSE=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // ""' | tr '[:lower:]' '[:upper:]' | tr -s '[:space:]' ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+              CLASSIFICATION=$(echo "$RAW_RESPONSE" | awk '{print $1}')
+              MODEL_FROM_LLM=$(echo "$RAW_RESPONSE" | awk '{print $2}')
+              if [[ -n "$CLASSIFICATION" ]] && [[ "$CLASSIFICATION" != "null" ]]; then
+                echo "::notice::Gemini classifier succeeded: $CLASSIFICATION"
+              fi
+            fi
+          fi
+
+          # Default model if not provided
+          if [[ -z "$MODEL_FROM_LLM" ]]; then
+            MODEL_FROM_LLM="DEFAULT"
+          fi
+
+          echo "Parsed: type=$CLASSIFICATION, model=$MODEL_FROM_LLM"
+
+          # Validate and normalize request type
+          case "$CLASSIFICATION" in
+            REVIEW) REQUEST_TYPE="review" ;;
+            BATCH) REQUEST_TYPE="batch" ;;
+            ASSIST|ASSISTANCE) REQUEST_TYPE="assistance" ;;
+            CANCEL) REQUEST_TYPE="cancel" ;;
+            HELP) REQUEST_TYPE="help" ;;
+            IGNORE) REQUEST_TYPE="ignore" ;;
+            *)
+              echo "::error::Unknown classification '$CLASSIFICATION' - rejecting to prevent prompt injection bypass"
+              echo "::warning::Raw response was: '$RAW_RESPONSE'"
+              REQUEST_TYPE="ignore"
+              echo "request_type=ignore" >> "$GITHUB_OUTPUT"
+              echo "model_override=" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          # Validate and normalize model selection
+          case "$MODEL_FROM_LLM" in
+            SONNET) MODEL_OVERRIDE="sonnet" ;;
+            OPUS) MODEL_OVERRIDE="opus" ;;
+            DEFAULT|*) MODEL_OVERRIDE="" ;;  # Empty means use workflow input
+          esac
+
+          # Warn if response has unexpected format
+          WORD_COUNT=$(echo "$RAW_RESPONSE" | wc -w | tr -d ' ')
+          if [[ "$WORD_COUNT" -gt 2 ]]; then
+            echo "::warning::Claude returned verbose response instead of two-word classification: ${RAW_RESPONSE:0:100}..."
+          fi
+
+          # Command detection - override classification if @bot command detected
+          COMMENT_LOWER=$(echo "$COMMENT_BODY" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//')
+          if [[ "$COMMENT_LOWER" =~ ^@(claude|styleseatbot)[[:space:]]*/?(review|re-review|rereview)($|[[:space:]]) ]]; then
+            echo "::notice::Command detected: review - overriding to REVIEW"
+            REQUEST_TYPE="review"
+          elif [[ "$COMMENT_LOWER" =~ ^@(claude|styleseatbot)[[:space:]]*/?(fix)($|[[:space:]]) ]]; then
+            # fix on code thread = queue the thread
+            if [[ "$IS_CODE_THREAD" == "true" ]]; then
+              echo "::notice::Command: fix on code thread - overriding to BATCH"
+              REQUEST_TYPE="batch"
+            fi
+          elif [[ "$COMMENT_LOWER" =~ ^@(claude|styleseatbot)[[:space:]]*/?(cancel|stop)($|[[:space:]]) ]]; then
+            echo "::notice::Command detected: cancel - overriding to CANCEL"
+            REQUEST_TYPE="cancel"
+          elif [[ "$COMMENT_LOWER" =~ ^@(claude|styleseatbot)[[:space:]]*/?(help|commands)($|[[:space:]]) ]]; then
+            echo "::notice::Command detected: help - overriding to HELP"
+            REQUEST_TYPE="help"
+          fi
+
+          # Fallback: If classification failed but comment clearly requests a review, use REVIEW
+          if [[ "$REQUEST_TYPE" == "assistance" ]]; then
+            COMMENT_LOWER=$(echo "$COMMENT_BODY" | tr '[:upper:]' '[:lower:]')
+            if [[ "$COMMENT_LOWER" =~ ^@(claude|styleseatbot)[[:space:]]*(review|lgtm) ]] || \
+               [[ "$IS_CODE_THREAD" == "false" && "$COMMENT_LOWER" =~ ^@(claude|styleseatbot)$ ]]; then
+              echo "::warning::Classification ambiguous but comment starts with '@trigger review' pattern - overriding to REVIEW"
+              REQUEST_TYPE="review"
+            fi
+          fi
+
+          # Safety net: IGNORE should never apply when comment explicitly asks for a review
+          if [[ "$REQUEST_TYPE" == "ignore" ]]; then
+            COMMENT_LOWER=$(echo "$COMMENT_BODY" | tr '[:upper:]' '[:lower:]')
+            if [[ "$COMMENT_LOWER" =~ (please[[:space:]]+review|review[[:space:]]+(this|again|the|my|our|pr|pull)|re-review|rereview) ]]; then
+              echo "::warning::Classifier returned IGNORE but comment contains explicit review request - overriding to REVIEW"
+              REQUEST_TYPE="review"
+            fi
+          fi
+
+          # Fallback: If on code thread with simple @mention, default to BATCH
+          if [[ "$REQUEST_TYPE" == "assistance" ]] && [[ "$IS_CODE_THREAD" == "true" ]]; then
+            COMMENT_LOWER=$(echo "$COMMENT_BODY" | tr '[:upper:]' '[:lower:]')
+            if [[ "$COMMENT_LOWER" =~ ^@(claude|styleseatbot) ]]; then
+              echo "::notice::Code thread comment defaulting to BATCH"
+              REQUEST_TYPE="batch"
+            fi
+          fi
+
+          # Note: Model override is determined by the classifier LLM (MODEL_OVERRIDE set above)
+          if [[ -n "$MODEL_OVERRIDE" ]]; then
+            echo "::notice::LLM detected model override: $MODEL_OVERRIDE"
+          fi
+
+          # ========================================
+          # PROVIDER FLAG DETECTION
+          # ========================================
+          PROVIDER_FLAG=""
+          if [[ "$COMMENT_LOWER" =~ --gpt ]]; then
+            PROVIDER_FLAG="openai"
+            echo "::notice::Provider flag detected: --gpt (openai)"
+          elif [[ "$COMMENT_LOWER" =~ --gemini ]]; then
+            PROVIDER_FLAG="gemini"
+            echo "::notice::Provider flag detected: --gemini"
+          elif [[ "$COMMENT_LOWER" =~ --claude ]]; then
+            PROVIDER_FLAG="claude"
+            echo "::notice::Provider flag detected: --claude"
+          fi
+
+          echo "Classified: type=$REQUEST_TYPE, model_override=${MODEL_OVERRIDE:-DEFAULT}"
+          {
+            echo "request_type=$REQUEST_TYPE"
+            echo "model_override=$MODEL_OVERRIDE"
+            echo "provider_flag=$PROVIDER_FLAG"
+          } >> "$GITHUB_OUTPUT"
+
+      # ========================================
+      # CANCEL HANDLING: Cancel running reviews if requested
+      # ========================================
+      - name: Handle cancel request
+        if: steps.classify_intent.outputs.request_type == 'cancel'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          echo "🛑 Cancel request detected!"
+
+          # Find and cancel all other running workflow runs for this PR
+          echo "Finding running workflow runs for PR #${PR_NUMBER}..."
+
+          # Find run IDs from progress comments on this PR
+          # Progress comments contain: <!-- claude-review pr=X run=Y -->
+          COMMENT_RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"<!-- claude-review pr=${PR_NUMBER} run=\")) | .body | capture(\"run=(?<run>[0-9]+)\") | .run] | unique | .[]" 2>/dev/null || echo "")
+
+          echo "Found run IDs in progress comments: $COMMENT_RUNS"
+
+          # Filter to only in-progress runs (excluding current run)
+          RUNS=""
+          for RUN_ID in $COMMENT_RUNS; do
+            if [[ "$RUN_ID" != "${{ github.run_id }}" ]]; then
+              STATUS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq '.status' 2>/dev/null || echo "unknown")
+              if [[ "$STATUS" == "in_progress" || "$STATUS" == "queued" ]]; then
+                RUNS="$RUNS $RUN_ID"
+              fi
+            fi
+          done
+          RUNS=$(printf '%s' "$RUNS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')  # trim whitespace
+
+          if [[ -n "$RUNS" ]]; then
+            echo "Cancelling runs: $RUNS"
+            for RUN_ID in $RUNS; do
+              echo "Cancelling run $RUN_ID..."
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/cancel" -X POST || echo "::warning::Failed to cancel run $RUN_ID"
+            done
+
+            # Post confirmation comment using jinja2 template
+            CANCELLED_COUNT=$(echo "$RUNS" | wc -w | tr -d ' ')
+            BODY=$(jinja2 -D cancelled_count="$CANCELLED_COUNT" /tmp/claude-resources/templates/code-review/cancellation/confirmed.jinja2)
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="$BODY"
+          else
+            echo "No other running reviews to cancel."
+            BODY=$(jinja2 /tmp/claude-resources/templates/code-review/cancellation/no_reviews.jinja2)
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="$BODY"
+          fi
+
+      - name: Exit if cancel or ignore
+        if: steps.classify_intent.outputs.request_type == 'cancel' || steps.classify_intent.outputs.request_type == 'ignore'
+        run: |
+          echo "Exiting: request_type=${{ steps.classify_intent.outputs.request_type }}"
+          exit 0
+
+      # ========================================
+      # CLEANUP: Delete previous cancelled/skipped runs for this PR
+      # These are "noise" runs that triggered but didn't match @claude/@styleseatbot
+      # Cleaning them up keeps the Actions UI tidy
+      # Only cleans up runs from the last 24 hours to avoid sweeping too much history
+      # ========================================
+      - name: Cleanup old cancelled runs
+        if: steps.classify_intent.outputs.request_type != 'cancel' && steps.classify_intent.outputs.request_type != 'ignore'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          echo "Cleaning up old cancelled/skipped workflow runs..."
+
+          # Get timestamp for 24 hours ago (ISO 8601 format)
+          SINCE=$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v-24H '+%Y-%m-%dT%H:%M:%SZ')
+
+          # Get cancelled Code Review runs from issue_comment events in the last 24 hours
+          # These are typically "noise" runs that didn't match the trigger pattern.
+          # Match both new ("Code Review") and legacy ("Claude Code") display names so the
+          # rebrand window doesn't leave orphaned cancelled runs.
+          RUNS_TO_DELETE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs" \
+            -f status=cancelled \
+            -f event=issue_comment \
+            -f created=">=$SINCE" \
+            --jq "[.workflow_runs[] | select(.name == \"Code Review\" or .name == \"Code Review (Reusable)\" or .name == \"Claude Code\" or .name == \"Claude Code (Reusable)\") | select(.id != ${{ github.run_id }}) | .id] | .[]" 2>/dev/null || echo "")
+
+          # Validate that the API returned actual run IDs (numeric values only).
+          # If the API returned an error response (e.g., 404 JSON), the --jq filter
+          # fails and the raw JSON error body leaks into RUNS_TO_DELETE. Without this
+          # check, the for loop word-splits the JSON into garbage tokens and tries to
+          # delete each one as a run ID.
+          if [[ -n "$RUNS_TO_DELETE" ]] && echo "$RUNS_TO_DELETE" | grep -qvE '^[0-9]+$'; then
+            echo "::warning::Cleanup query returned unexpected data, skipping deletion"
+            RUNS_TO_DELETE=""
+          fi
+
+          # Count and delete
+          if [[ -n "$RUNS_TO_DELETE" ]]; then
+            COUNT=$(echo "$RUNS_TO_DELETE" | wc -l | tr -d ' ')
+            echo "Found $COUNT cancelled runs to delete"
+
+            for RUN_ID in $RUNS_TO_DELETE; do
+              echo "Deleting run $RUN_ID..."
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" -X DELETE 2>/dev/null || echo "::warning::Failed to delete run $RUN_ID"
+            done
+
+            echo "::notice::Cleaned up $COUNT old cancelled workflow runs"
+          else
+            echo "No cancelled runs to clean up"
+          fi
+
+      # ========================================
+      # PROVIDER RESOLUTION: Determine which LLM provider to use
+      # Priority: comment flag > A/B assignment > workflow input > default
+      # ========================================
+      - name: Resolve provider
+        id: resolve_provider
+        if: steps.classify_intent.outputs.request_type != 'cancel' && steps.classify_intent.outputs.request_type != 'ignore'
+        env:
+          PROVIDER_FLAG: ${{ steps.classify_intent.outputs.provider_flag }}
+          AB_ENABLED: ${{ inputs.ab_enabled }}
+          AB_CONFIG: ${{ vars.AB_CONFIG || '' }}
+          AB_PROVIDERS: ${{ inputs.ab_providers }}
+          AB_WEIGHTS: ${{ inputs.ab_weights }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          INPUT_PROVIDER: ${{ inputs.provider }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
+          RESOURCES_DIR: ${{ steps.fetch_resources.outputs.resources_dir }}
+        run: |
+          set -euo pipefail
+          python3 -m styleseatbot resolve
+
+          # Read outputs written by the Python CLI to GITHUB_OUTPUT
+          PROVIDER=$(grep "^provider=" "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)
+          FAILOVER_CHAIN=$(grep "^failover_chain=" "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)
+          {
+            echo "ACTIVE_PROVIDER=$PROVIDER"
+            echo "FAILOVER_TRIGGERED=false"
+            echo "FAILOVER_COUNT=0"
+            echo "FAILOVER_CHAIN=$FAILOVER_CHAIN"
+          } >> "$GITHUB_ENV"
+          echo "::notice::Resolved provider: $PROVIDER"
+
+          # Write provider state for prompts to read
+          mkdir -p /tmp/claude
+          AB_ASSIGNED=$(grep "^ab_assigned=" "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)
+          VERSION="unknown"
+          if [[ -f "$RESOURCES_DIR/VERSION" ]]; then
+            VERSION=$(tr -d '[:space:]' < "$RESOURCES_DIR/VERSION")
+          fi
+
+          AB_MODEL=$(grep "^ab_model=" "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2-)
+
+          # Assign A/B group label (A, B, C, etc.) based on provider order
+          AB_GROUP=""
+          if [[ -n "$AB_ASSIGNED" ]]; then
+            AB_LABELS=("A" "B" "C" "D" "E" "F" "G" "H")
+            # Use JSON config entries if available, fall back to legacy AB_PROVIDERS
+            if [[ -n "${AB_CONFIG:-}" ]] && echo "$AB_CONFIG" | jq empty 2>/dev/null; then
+              AB_PROV_JSON=$(echo "$AB_CONFIG" | jq -r '[.entries[].provider] | join(",")')
+              IFS=',' read -ra AB_PROV_LIST <<< "$AB_PROV_JSON"
+            else
+              IFS=',' read -ra AB_PROV_LIST <<< "$AB_PROVIDERS"
+            fi
+            for i in "${!AB_PROV_LIST[@]}"; do
+              if [[ "${AB_PROV_LIST[$i]}" == "$AB_ASSIGNED" ]]; then
+                AB_GROUP="${AB_LABELS[$i]:-}"
+                break
+              fi
+            done
+          fi
+
+          jq -n \
+            --arg original_provider "$PROVIDER" \
+            --arg active_provider "$PROVIDER" \
+            --argjson failover_triggered false \
+            --argjson failover_history '[]' \
+            --arg ab_assigned "$AB_ASSIGNED" \
+            --arg ab_group "$AB_GROUP" \
+            --arg ab_model "$AB_MODEL" \
+            --arg version "$VERSION" \
+            '{
+              original_provider: $original_provider,
+              active_provider: $active_provider,
+              failover_triggered: $failover_triggered,
+              failover_history: $failover_history,
+              ab_assigned: $ab_assigned,
+              ab_group: $ab_group,
+              ab_model: $ab_model,
+              version: $version
+            }' > /tmp/claude/provider_state.json
+
+      # ========================================
+      # MODEL RESOLUTION: Determine which Claude model to use
+      # Priority: classifier LLM detection > inputs.model (default: opus)
+      # The classifier analyzes the comment and returns SONNET/OPUS/DEFAULT
+      # DEFAULT means "use inputs.model"
+      # ========================================
+      - name: Resolve model
+        id: resolve_model
+        run: |
+          set -euo pipefail
+
+          INPUT_MODEL="${{ inputs.model || 'opus' }}"
+          LLM_MODEL="${{ steps.classify_intent.outputs.model_override }}"
+
+          # Priority: LLM detection > workflow input
+          if [[ -n "$LLM_MODEL" ]]; then
+            # Classifier LLM detected explicit model request in comment
+            RESOLVED_MODEL="$LLM_MODEL"
+            echo "::notice::Model from classifier LLM detection: $RESOLVED_MODEL"
+          else
+            # Use workflow input (defaults to opus)
+            RESOLVED_MODEL="$INPUT_MODEL"
+            echo "::notice::Model from workflow input: $RESOLVED_MODEL"
+          fi
+
+          # Map short names to model aliases (undated = always latest)
+          OPUS_ID="claude-opus-4-6"
+          SONNET_ID="claude-sonnet-4-6"
+
+          case "$RESOLVED_MODEL" in
+            opus)
+              MODEL_ID="$OPUS_ID"
+              ;;
+            sonnet)
+              MODEL_ID="$SONNET_ID"
+              ;;
+            *)
+              echo "::warning::Unknown model '$RESOLVED_MODEL', defaulting to opus"
+              RESOLVED_MODEL="opus"
+              MODEL_ID="$OPUS_ID"
+              ;;
+          esac
+
+          echo "Resolved base model: $RESOLVED_MODEL (ID: $MODEL_ID)"
+          {
+            echo "model=$RESOLVED_MODEL"
+            echo "model_id=$MODEL_ID"
+          } >> "$GITHUB_OUTPUT"
+
+          # Per-phase model assignment:
+          # When base=opus, only planning (Phase 1) and review (Phase 3) use Opus.
+          # All other phases use Sonnet (sufficient for structured/mechanical work, ~5x cheaper).
+          # When base=sonnet, all phases use Sonnet.
+          if [[ "$RESOLVED_MODEL" == "opus" ]]; then
+            {
+              echo "phase1_model_id=$OPUS_ID"     # Planning: needs strategic reasoning
+              echo "phase2_model_id=$SONNET_ID"    # Context: data gathering, checklists
+              echo "phase3_model_id=$OPUS_ID"     # Review: core value, deep analysis
+              echo "phase4_model_id=$SONNET_ID"    # Verify: fact-checking, not generating
+              echo "phase5_model_id=$SONNET_ID"    # Post: mechanical API operations
+              echo "engagement_model_id=$SONNET_ID"
+              echo "assistance_model_id=$SONNET_ID"
+              # "max" effort is Opus 4.6 exclusive; use the env var value when on Opus
+              echo "phase3_effort=${PHASE3_EFFORT:-max}"
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::Per-phase models: P1=opus, P2=sonnet, P3=opus, P4=sonnet, P5=sonnet"
+          else
+            {
+              echo "phase1_model_id=$SONNET_ID"
+              echo "phase2_model_id=$SONNET_ID"
+              echo "phase3_model_id=$SONNET_ID"
+              echo "phase4_model_id=$SONNET_ID"
+              echo "phase5_model_id=$SONNET_ID"
+              echo "engagement_model_id=$SONNET_ID"
+              echo "assistance_model_id=$SONNET_ID"
+              # "max" effort errors on non-Opus models; fall back to "high"
+              echo "phase3_effort=high"
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::All phases using sonnet (phase3 effort capped at high)"
+          fi
+
+          # If provider is not Claude, override model IDs using provider-model-map
+          PROVIDER="${{ steps.resolve_provider.outputs.provider || 'claude' }}"
+          if [[ "$PROVIDER" != "claude" ]]; then
+            python3 -m styleseatbot model-map "$PROVIDER" "$RESOLVED_MODEL"
+            echo "::notice::Provider $PROVIDER model map applied"
+          fi
+
+      # ========================================
+      # BATCH MODE: Add task to queue comment
+      # ========================================
+      - name: Handle batch mode
+        if: steps.classify_intent.outputs.request_type == 'batch'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          COMMENT_BODY: ${{ steps.fetch_resources.outputs.comment_body || github.event.comment.body || github.event.review.body }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          COMMENT_PATH: ${{ github.event.comment.path }}
+          COMMENT_LINE: ${{ github.event.comment.line || github.event.comment.original_line }}
+        run: |
+          set -euo pipefail
+
+          echo "============================================"
+          echo "BATCH MODE: Adding task to queue"
+          echo "============================================"
+
+          # Extract the request text (remove @mentions)
+          REQUEST_TEXT=$(printf '%s' "$COMMENT_BODY" | sed -E 's/@(claude|styleseatbot)//gi;s/^[[:space:]]*//;s/[[:space:]]*$//')
+          if [[ -z "$REQUEST_TEXT" ]]; then
+            REQUEST_TEXT="Address this"
+          fi
+
+          # Sanitize: remove characters that break markdown links
+          REQUEST_TEXT=$(printf '%s' "$REQUEST_TEXT" | tr -d '[]()' | head -c 200)
+
+          # Truncate long requests for the queue display
+          if [[ ${#REQUEST_TEXT} -gt 80 ]]; then
+            REQUEST_TEXT="${REQUEST_TEXT:0:77}..."
+          fi
+
+          # Build file:line reference (without backticks, for template)
+          FILE_INFO=""
+          if [[ -n "$COMMENT_PATH" ]]; then
+            FILE_INFO="${COMMENT_PATH}"
+            if [[ -n "$COMMENT_LINE" ]]; then
+              FILE_INFO="${FILE_INFO}:${COMMENT_LINE}"
+            fi
+          fi
+
+          # Build the new queue item (for adding to existing comment)
+          if [[ -n "$FILE_INFO" ]]; then
+            NEW_ITEM="- [ ] [${REQUEST_TEXT}](${COMMENT_URL}) \`${FILE_INFO}\`"
+          else
+            NEW_ITEM="- [ ] [${REQUEST_TEXT}](${COMMENT_URL})"
+          fi
+          echo "New item: $NEW_ITEM"
+
+          # Find existing batch comment with timestamp (paginate to handle PRs with many comments)
+          BATCH_COMMENT=$( (gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq '[.[] | select(.body | contains("<!-- claude-batch pr=")) | {id: .id, body: .body, created_at: .created_at}]' \
+            | jq -s 'add // [] | last // empty') 2>/dev/null || echo "")
+
+          # Find most recent bot review timestamp (paginate to handle PRs with 30+ reviews)
+          LATEST_BOT_REVIEW=$( (gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
+            --paginate \
+            --jq '[.[] | select(.user.login | test("styleseatbot\\[bot\\]|claude\\[bot\\]|github-actions\\[bot\\]"))]' \
+            | jq -s 'add // [] | sort_by(.submitted_at) | last | .submitted_at // ""') 2>/dev/null || echo "")
+
+          # Determine if we should create new or update existing
+          CREATE_NEW="true"
+          if [[ -n "$BATCH_COMMENT" ]]; then
+            BATCH_CREATED=$(echo "$BATCH_COMMENT" | jq -r '.created_at')
+            echo "Found existing batch comment created at: $BATCH_CREATED"
+            echo "Latest bot review at: ${LATEST_BOT_REVIEW:-none}"
+
+            if [[ -z "$LATEST_BOT_REVIEW" ]]; then
+              # No bot review exists, safe to update existing queue
+              CREATE_NEW="false"
+              echo "No bot review found - will update existing queue"
+            elif [[ "$BATCH_CREATED" > "$LATEST_BOT_REVIEW" ]]; then
+              # Batch comment is newer than last review, safe to update
+              CREATE_NEW="false"
+              echo "Batch comment is after latest review - will update existing queue"
+            else
+              # Batch comment predates the review - create new queue
+              echo "Batch comment predates latest review - will create new queue"
+            fi
+          fi
+
+          if [[ "$CREATE_NEW" == "true" ]]; then
+            echo "Creating new batch comment..."
+
+            # Create new batch comment using jinja2 template
+            if [[ -n "$FILE_INFO" ]]; then
+              BATCH_BODY=$(jinja2 -D pr_number="$PR_NUMBER" -D item_text="$REQUEST_TEXT" -D item_url="$COMMENT_URL" -D file_info="$FILE_INFO" /tmp/claude-resources/templates/code-review/batch/queue.jinja2)
+            else
+              BATCH_BODY=$(jinja2 -D pr_number="$PR_NUMBER" -D item_text="$REQUEST_TEXT" -D item_url="$COMMENT_URL" /tmp/claude-resources/templates/code-review/batch/queue.jinja2)
+            fi
+
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="$BATCH_BODY"
+            echo "Created new batch comment with task"
+          else
+            echo "Updating existing batch comment..."
+
+            BATCH_ID=$(echo "$BATCH_COMMENT" | jq -r '.id')
+            EXISTING_BODY=$(echo "$BATCH_COMMENT" | jq -r '.body')
+
+            # Check if this URL is already in the queue (avoid duplicates)
+            if echo "$EXISTING_BODY" | grep -qF "$COMMENT_URL"; then
+              echo "Task already in queue, skipping duplicate"
+              exit 0
+            fi
+
+            # Insert new item before the "---" separator
+            # Use awk for reliable multiline handling
+            UPDATED_BODY=$(echo "$EXISTING_BODY" | awk -v item="$NEW_ITEM" '
+              /^---$/ && !inserted {
+                print item
+                inserted=1
+              }
+              {print}
+            ')
+
+            gh api "repos/${GITHUB_REPOSITORY}/issues/comments/${BATCH_ID}" \
+              -X PATCH \
+              -f body="$UPDATED_BODY"
+            echo "Added task to existing batch comment"
+          fi
+
+          echo "============================================"
+          echo "Task queued! Copy the task queue comment URL to your local AI assistant."
+          echo "============================================"
+
+      - name: Exit after batch
+        if: steps.classify_intent.outputs.request_type == 'batch'
+        run: |
+          echo "Batch task queued. Exiting without Claude invocation."
+          exit 0
+
+      # ========================================
+      # HELP HANDLER: Display available commands
+      # ========================================
+      - name: Handle help request
+        if: steps.classify_intent.outputs.request_type == 'help'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          echo "============================================"
+          echo "HELP: Posting available commands"
+          echo "============================================"
+
+          BODY=$(jinja2 /tmp/claude-resources/templates/code-review/help.jinja2)
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -f body="$BODY"
+
+      - name: Exit after help
+        if: steps.classify_intent.outputs.request_type == 'help'
+        run: |
+          echo "Help message posted. Exiting."
+          exit 0
+
+      # ========================================
+      # WORKFLOW TIMING: Record start time
+      # ========================================
+      - name: Record workflow start time
+        id: workflow_timing
+        run: |
+          set -euo pipefail
+          WORKFLOW_START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "workflow_start_time=${WORKFLOW_START_TIME}" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/claude
+          echo "${WORKFLOW_START_TIME}" > /tmp/claude/workflow-start-time.txt
+          echo "Workflow started at: ${WORKFLOW_START_TIME}"
+
+      - name: Check for in-progress runs
+        id: check_runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          # Note: Not using set -e here because we want to handle API failures gracefully
+          set -uo pipefail
+
+          echo "Checking for other in-progress Claude runs..."
+          echo "Current run ID: ${GITHUB_RUN_ID}"
+          echo "PR/Issue number: ${PR_NUMBER}"
+
+          # If no PR number, skip the duplicate check (can't filter without it)
+          if [[ -z "${PR_NUMBER}" ]] || [[ "${PR_NUMBER}" == "0" ]]; then
+            echo "::warning::No PR/Issue number available. Cannot check for duplicates."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Query GitHub API for workflow runs
+          # - Filter by "Code Review" workflow name (caller workflow name, not the reusable; legacy "Claude Code" is also matched)
+          # - Check both "in_progress" and "queued" to handle race conditions
+          # - Exclude current run ID
+          # - Use per_page=100 to reduce chance of missing runs due to pagination
+          #
+          # Note: We filter by PR number using the event payload display_title which contains "PR #N"
+          # or by checking the head_branch which often contains the PR info
+          API_RESPONSE=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" 2>&1) || {
+            echo "::warning::Failed to query GitHub API for workflow runs. Proceeding anyway to avoid blocking."
+            echo "API error: ${API_RESPONSE}"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # Find runs that match our criteria:
+          # 1. Status is in_progress or queued
+          # 2. Workflow name is "Code Review" (or legacy "Claude Code") — the caller workflow name
+          # 3. Not the current run
+          # 4. Same PR number - checked via multiple methods for reliability:
+          #    a) pull_requests array contains a PR with matching number
+          #    b) display_title contains "#N" with word boundary (fallback for issue_comment events)
+          #
+          # Note: The workflow name "Code Review" must match the 'name:' field in calling workflows.
+          # "Claude Code" is the legacy name; we match both during the rebrand window so consumer
+          # repos still on the old name continue to be deduped correctly.
+          BLOCKING_RUNS=$(echo "$API_RESPONSE" | jq -r --argjson pr_num "${PR_NUMBER}" --argjson current_id "${GITHUB_RUN_ID}" '
+            [.workflow_runs[] | select(
+              (.status == "in_progress" or .status == "queued") and
+              (.name == "Code Review" or .name == "Claude Code") and
+              .id != $current_id and
+              (
+                # Method 1: Check pull_requests array for matching PR number
+                (.pull_requests // [] | any(.number == $pr_num)) or
+                # Method 2: Check display_title contains "#N" with word boundary to avoid #12 matching #123
+                (.display_title | test("#\($pr_num)(\\s|$|[^0-9])"))
+              )
+            )] | unique_by(.id)')
+
+          BLOCKING_COUNT=$(echo "$BLOCKING_RUNS" | jq 'length' 2>/dev/null || echo "0")
+
+          echo "Found ${BLOCKING_COUNT} other in-progress/queued Claude runs for PR #${PR_NUMBER}"
+
+          if [[ "$BLOCKING_COUNT" -gt 0 ]]; then
+            # Log details about blocking runs for debugging
+            echo ""
+            echo "Blocking runs:"
+            echo "$BLOCKING_RUNS" | jq -r '.[] | "  - Run #\(.run_number) (ID: \(.id), status: \(.status)) - \(.html_url)"'
+            echo ""
+
+            echo "::notice::Another Claude workflow is already running for PR #${PR_NUMBER}. Skipping this run to prevent duplicate work."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No other runs in progress for this PR. Proceeding."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.check_runs.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
+          submodules: recursive
+
+      # issue_comment events run on the DEFAULT branch (main), not the PR branch.
+      # actions/checkout without an explicit ref checks out main, so we must
+      # fetch and switch to the PR's head ref for file diffs and code review
+      # to work correctly.
+      - name: Checkout PR head ref
+        if: steps.check_runs.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${PR_NUMBER}" ]] || [[ "${PR_NUMBER}" == "0" ]]; then
+            echo "No PR number available, staying on current branch."
+            exit 0
+          fi
+
+          # Get the PR head SHA and ref name from the GitHub API
+          PR_HEAD_SHA=$(gh pr view "${PR_NUMBER}" --json headRefOid --jq .headRefOid) || {
+            echo "::warning::Could not get PR head SHA. Staying on current branch."
+            exit 0
+          }
+          PR_HEAD_REF=$(gh pr view "${PR_NUMBER}" --json headRefName --jq .headRefName) || {
+            echo "::warning::Could not get PR head ref name. Staying on current branch."
+            exit 0
+          }
+
+          echo "PR #${PR_NUMBER} head: ${PR_HEAD_REF} (${PR_HEAD_SHA})"
+
+          # Fetch the PR head ref with enough depth for merge-base computation
+          git fetch origin "${PR_HEAD_REF}" --depth=50 || {
+            echo "::warning::Could not fetch PR head ref ${PR_HEAD_REF}. Staying on current branch."
+            exit 0
+          }
+
+          # Checkout the PR head commit
+          git checkout "${PR_HEAD_SHA}" || {
+            echo "::error::Failed to checkout PR head SHA ${PR_HEAD_SHA}"
+            exit 1
+          }
+
+          echo "Checked out PR head: $(git log -1 --oneline)"
+
+      - name: Capture review commit SHA
+        if: steps.check_runs.outputs.skip != 'true'
+        id: review_commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          # Capture the HEAD commit SHA of the PR at the time we start reviewing.
+          # This SHA will be used when posting the review to ensure comments are
+          # attached to the code we actually reviewed, even if new commits are
+          # pushed during the review process.
+          if [[ -n "${PR_NUMBER}" ]] && [[ "${PR_NUMBER}" != "0" ]]; then
+            COMMIT_SHA=$(gh pr view "${PR_NUMBER}" --json headRefOid --jq .headRefOid) || {
+              echo "::error::Failed to get PR HEAD commit SHA from GitHub API"
+              exit 1
+            }
+            if [[ -z "${COMMIT_SHA}" ]]; then
+              echo "::error::Got empty commit SHA from PR - API may have returned unexpected data"
+              exit 1
+            fi
+          else
+            # Fallback to current HEAD if no PR number
+            COMMIT_SHA=$(git rev-parse HEAD)
+          fi
+
+          echo "Review will be posted against commit: ${COMMIT_SHA}"
+          echo "sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+
+          # Also write to artifact directory for phases to read
+          mkdir -p /tmp/claude
+          echo "${COMMIT_SHA}" > /tmp/claude/review-commit-sha.txt
+
+      - name: Restore review memory
+        if: steps.check_runs.outputs.skip != 'true'
+        id: restore_memory
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/claude/review-memory.json
+          key: review-memory-${{ github.event.issue.number || github.event.pull_request.number }}-${{ github.run_id }}
+          restore-keys: |
+            review-memory-${{ github.event.issue.number || github.event.pull_request.number }}-
+
+      - name: Initialize review memory state
+        if: steps.check_runs.outputs.skip != 'true'
+        id: memory_state
+        shell: bash
+        run: |
+          set -euo pipefail
+          styleseatbot memory-init --memory-path /tmp/claude/review-memory.json
+
+      - name: Generate deterministic file list
+        if: steps.check_runs.outputs.skip != 'true'
+        id: file_list
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/claude
+
+          # Get the PR's base branch
+          BASE_REF=$(gh pr view "$PR_NUMBER" --json baseRefName --jq .baseRefName)
+          echo "PR base branch: $BASE_REF"
+
+          # Fetch the base branch for merge-base computation
+          MERGE_BASE=""
+          if git fetch origin "$BASE_REF" --depth=50 2>/dev/null || git fetch origin "$BASE_REF" 2>/dev/null; then
+            MERGE_BASE=$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null || echo "")
+          fi
+
+          if [[ -n "$MERGE_BASE" ]]; then
+            git log --no-merges --name-only --format= "$MERGE_BASE"..HEAD | sort -u > /tmp/claude/changed-files.txt
+          else
+            echo "::warning::Could not compute merge base. Using HEAD~10 fallback."
+            MERGE_BASE=$(git rev-parse HEAD~10 2>/dev/null || git hash-object -t tree /dev/null)
+            git log --no-merges --name-only --format= HEAD~10..HEAD 2>/dev/null | sort -u > /tmp/claude/changed-files.txt || true
+          fi
+
+          FILE_COUNT=$(wc -l < /tmp/claude/changed-files.txt)
+          echo "Deterministic file list: $FILE_COUNT files changed"
+          echo "changed_files_path=/tmp/claude/changed-files.txt" >> "$GITHUB_OUTPUT"
+
+          # --- Runs once, after changed-files.txt and MERGE_BASE are set by whichever path above ---
+
+          # Save merge base for review memory
+          echo "$MERGE_BASE" > /tmp/claude/merge-base.txt
+
+          # Compute per-file content hashes (rebase-resilient)
+          styleseatbot compute-hashes \
+            --merge-base "$MERGE_BASE" \
+            --changed-files-path /tmp/claude/changed-files.txt \
+            --output-path /tmp/claude/file-change-hashes.json
+
+          # Compare against cached review memory
+          styleseatbot diff-hashes \
+            --memory-path /tmp/claude/review-memory.json \
+            --current-hashes-path /tmp/claude/file-change-hashes.json \
+            --output-path /tmp/claude/changed-since-last-review.json
+
+      - name: Install Claude skills and commands
+        if: steps.check_runs.outputs.skip != 'true' && steps.file_list.outputs.skip_no_changes != 'true'
+        shell: bash
+        run: |
+          mkdir -p ~/.claude/skills ~/.claude/commands ~/.claude/hooks ~/.claude/lib ~/.claude/agents
+
+          # Clone superpowers repo
+          echo "Cloning obra/superpowers..."
+          git init /tmp/superpowers
+          (cd /tmp/superpowers && \
+            git fetch --depth 1 https://github.com/obra/superpowers.git 154d664373569a83289684d7b01742a82cca4eaf && \
+            git checkout -q FETCH_HEAD)
+
+          # Copy directories
+          for dir in skills commands hooks lib agents; do
+            if [ -d "/tmp/superpowers/$dir" ]; then
+              cp -r "/tmp/superpowers/$dir" ~/.claude/
+              echo "✓ Installed $dir from superpowers"
+            fi
+          done
+
+          rm -rf /tmp/superpowers
+
+          # Install bundled review skills from this repo (checked out at $GITHUB_WORKSPACE)
+          if [ -d "${GITHUB_WORKSPACE}/prompts/code-review/skills" ]; then
+            cp -r "${GITHUB_WORKSPACE}/prompts/code-review/skills/"* ~/.claude/skills/
+            echo "✓ Installed bundled code-review skills from ${GITHUB_WORKSPACE}/prompts/code-review/skills"
+          else
+            echo "::warning::Bundled code-review skills directory not found at ${GITHUB_WORKSPACE}/prompts/code-review/skills"
+          fi
+
+          echo "Installation complete."
+          echo "Available skills:"
+          # -maxdepth 2 captures both flat skills (skills/foo.md) and packaged
+          # ones (skills/foo/SKILL.md) so the diagnostic reflects what the
+          # skill loader actually finds.
+          find ~/.claude/skills/ -maxdepth 2 -type f -name "*.md" 2>/dev/null | head -20 || true
+          echo "Available commands:"
+          find ~/.claude/commands/ -maxdepth 1 -type f -name "*.md" 2>/dev/null | head -20 || true
+          echo "Available hooks:"
+          find ~/.claude/hooks/ -maxdepth 1 -type f 2>/dev/null | head -20 || true
+          echo "Available agents:"
+          find ~/.claude/agents/ -maxdepth 1 -type f -name "*.md" 2>/dev/null | head -20 || true
+
+      - name: Detect request type
+        # Intentionally NOT gated on file_list.skip_no_changes: the
+        # "Skip review (no diff-relevant changes)" step downstream
+        # references detect_type.outputs.request_type to fire only on
+        # review-type runs. If detect_type were skipped, its outputs
+        # would be empty and the skip-review step's gate would never
+        # match, causing a silent fall-through. detect_type is cheap.
+        if: steps.check_runs.outputs.skip != 'true'
+        id: detect_type
+        shell: bash
+        env:
+          COMMENT_BODY: ${{ steps.fetch_resources.outputs.comment_body || github.event.comment.body || github.event.review.body || github.event.issue.body || github.event.pull_request.body }}
+          GH_TOKEN: ${{ github.token }}
+          CLASSIFIED_TYPE: ${{ steps.classify_intent.outputs.request_type }}
+        run: |
+          set -euo pipefail
+
+          # Use classification from earlier step
+          REQUEST_TYPE="$CLASSIFIED_TYPE"
+          echo "Using classified request type: $REQUEST_TYPE"
+
+          # ---------------------------------------------------------
+          # SCOPE & MODE ANALYSIS
+          # ---------------------------------------------------------
+          PR_NUMBER="${{ github.event.issue.number || github.event.pull_request.number }}"
+
+          # Default values
+          SCOPE="medium"
+          MODE="code"
+
+          if [[ -n "$PR_NUMBER" ]]; then
+            # Fetch PR stats
+            STATS=$(gh pr view "$PR_NUMBER" --json additions,deletions,files)
+            ADDITIONS=$(echo "$STATS" | jq '.additions')
+            DELETIONS=$(echo "$STATS" | jq '.deletions')
+            FILE_COUNT=$(echo "$STATS" | jq '(.files // []) | length')
+            FILES=$(echo "$STATS" | jq -r '(.files // [])[].path')
+
+            # ---------------------------------------------------------
+            # RISK-WEIGHTED SCOPE CALCULATION
+            # ---------------------------------------------------------
+            # Factors considered:
+            # 1. Change type: deletions are safer than additions, mixed (refactoring) needs scrutiny
+            # 2. File count: single file = contained blast radius
+            # 3. File types: style-only changes are lower risk
+
+            # Base risk score by change type
+            if [[ "$ADDITIONS" -eq 0 && "$DELETIONS" -gt 0 ]]; then
+              # Pure deletion - safest (25% weight)
+              RISK_SCORE=$((DELETIONS / 4))
+              CHANGE_TYPE="deletion-only"
+            elif [[ "$DELETIONS" -eq 0 && "$ADDITIONS" -gt 0 ]]; then
+              # Pure addition - standard weight
+              RISK_SCORE=$ADDITIONS
+              CHANGE_TYPE="addition-only"
+            else
+              # Mixed changes (refactoring) - higher scrutiny (110% of total)
+              RISK_SCORE=$(( (ADDITIONS + DELETIONS) * 11 / 10 ))
+              CHANGE_TYPE="mixed"
+            fi
+
+            # File count multiplier (single file = 0.75x, 2-3 files = 1x, 4+ = 1.25x)
+            if [[ "$FILE_COUNT" -eq 1 ]]; then
+              RISK_SCORE=$((RISK_SCORE * 3 / 4))
+            elif [[ "$FILE_COUNT" -ge 4 ]]; then
+              RISK_SCORE=$((RISK_SCORE * 5 / 4))
+            fi
+
+            # Check for style-only changes (CSS/SCSS/LESS)
+            IS_STYLE_ONLY=true
+            while IFS= read -r file; do
+              case "$file" in
+                *.css|*.scss|*.sass|*.less) ;;
+                *) IS_STYLE_ONLY=false; break ;;
+              esac
+            done <<< "$FILES"
+
+            if [[ "$IS_STYLE_ONLY" == "true" ]]; then
+              RISK_SCORE=$((RISK_SCORE / 2))
+            fi
+
+            # Check for test-only changes (test files don't affect production)
+            IS_TEST_ONLY=true
+            while IFS= read -r file; do
+              case "$file" in
+                # Test config files (jest, vitest, etc.) - check first, more specific
+                jest.config.*|vitest.config.*) ;;
+                # Common test file patterns
+                *.test.*|*.spec.*|*_test.*|*_spec.*) ;;
+                # Test directories
+                __tests__/*|tests/*|test/*|spec/*) ;;
+                *) IS_TEST_ONLY=false; break ;;
+              esac
+            done <<< "$FILES"
+
+            if [[ "$IS_TEST_ONLY" == "true" ]]; then
+              RISK_SCORE=$((RISK_SCORE / 2))
+            fi
+
+            # Determine SCOPE from risk score
+            if [[ "$RISK_SCORE" -lt 50 ]]; then
+              SCOPE="tiny"
+            elif [[ "$RISK_SCORE" -gt 400 ]]; then
+              SCOPE="huge"
+            fi
+
+            echo "Risk calculation: type=$CHANGE_TYPE, files=$FILE_COUNT, style_only=$IS_STYLE_ONLY, test_only=$IS_TEST_ONLY, score=$RISK_SCORE"
+
+            # ---------------------------------------------------------
+            # MODE DETECTION
+            # ---------------------------------------------------------
+            # Determine MODE based on file extensions
+            IS_DOCS_ONLY=true
+            IS_CONFIG_ONLY=true
+
+            while IFS= read -r file; do
+              if [[ "$file" != *.md ]] && [[ "$file" != *.txt ]]; then
+                IS_DOCS_ONLY=false
+              fi
+              if [[ "$file" != *.json ]] && [[ "$file" != *.yaml ]] && [[ "$file" != *.yml ]] && [[ "$file" != *.env* ]]; then
+                IS_CONFIG_ONLY=false
+              fi
+            done <<< "$FILES"
+
+            if [[ "$IS_DOCS_ONLY" == "true" ]]; then
+              MODE="docs"
+            elif [[ "$IS_CONFIG_ONLY" == "true" ]]; then
+              MODE="config"
+            fi
+          fi
+
+          echo "Calculated SCOPE=$SCOPE, MODE=$MODE"
+          {
+            echo "scope=$SCOPE"
+            echo "mode=$MODE"
+            echo "request_type=$REQUEST_TYPE"
+            DELIM="COMMENT_EOF_$(openssl rand -hex 8)"
+            echo "comment_body<<${DELIM}"
+            echo "$COMMENT_BODY"
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Detected request type: $REQUEST_TYPE"
+
+      - name: Verify app token
+        if: steps.check_runs.outputs.skip != 'true' && steps.file_list.outputs.skip_no_changes != 'true'
+        env:
+          APP_TOKEN: ${{ steps.app_token.outputs.token }}
+          DEFAULT_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "=== Token Verification ==="
+          # NOTE: /user endpoint returns 403 for GitHub App installation tokens
+          # and Actions tokens because it requires user-scoped auth. We verify
+          # repo access instead, which is what the workflow actually needs.
+
+          if [[ -n "$APP_TOKEN" ]]; then
+            echo "✅ App token is set"
+            # Verify app token can access the target repo
+            if APP_PERMS=$(GH_TOKEN="$APP_TOKEN" gh api "repos/$REPO" --jq '.permissions' 2>&1); then
+              echo "App token has repo access: $APP_PERMS"
+            else
+              echo "⚠️ App token cannot access $REPO (may lack permissions)"
+            fi
+          else
+            echo "❌ App token is EMPTY - will fall back to github.token"
+          fi
+
+          # Check default token can access the repo
+          if DEFAULT_PERMS=$(GH_TOKEN="$DEFAULT_TOKEN" gh api "repos/$REPO" --jq '.permissions' 2>&1); then
+            echo "Default github.token has repo access: $DEFAULT_PERMS"
+          else
+            echo "⚠️ Default github.token cannot access $REPO"
+          fi
+
+      # ========================================
+      # COMMENT AGGREGATION: Collect all trigger comments (@claude, @styleseatbot)
+      # ========================================
+      - name: Collect aggregated comments
+        if: steps.check_runs.outputs.skip != 'true' && steps.file_list.outputs.skip_no_changes != 'true'
+        id: collect_comments
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          WORKFLOW_START_TIME: ${{ steps.workflow_timing.outputs.workflow_start_time }}
+        run: |
+          set -euo pipefail
+
+          echo "============================================"
+          echo "COLLECTING AGGREGATED TRIGGER COMMENTS"
+          echo "============================================"
+          echo "Supported triggers: @claude, @styleseatbot"
+          echo "PR/Issue: #${PR_NUMBER}"
+          echo ""
+
+          # Pagination helper - fetches all pages from a GitHub API endpoint
+          # Handles >100 comments by iterating through pages
+          # IMPROVED: Fixed O(n²) array merging by accumulating batches and merging once
+          # IMPROVED: Increased pagination limit from 10 to 100 pages (10K items max)
+          # IMPROVED: Added warning when pagination limit is reached
+          fetch_all_pages() {
+            local endpoint="$1"
+            local jq_filter="$2"
+            local page=1
+            local max_pages=100  # Increased from 10 to 100 (10K items max)
+            local batches=()
+
+            while [[ $page -le $max_pages ]]; do
+              local batch
+              # IMPROVED: Capture stderr for error handling instead of silently suppressing
+              if ! batch=$(gh api "${endpoint}?per_page=100&page=${page}" --jq "$jq_filter" 2>&1); then
+                echo "::error::Failed to fetch from $endpoint page $page: $batch" >&2
+                return 1
+              fi
+              local batch_length
+              batch_length=$(echo "$batch" | jq 'length')
+
+              if [[ "$batch_length" -eq 0 ]]; then
+                break
+              fi
+
+              # IMPROVED: Accumulate batches instead of merging on every iteration (O(n) instead of O(n²))
+              batches+=("$batch")
+
+              # IMPROVED: Warn if we hit the pagination limit with a full page
+              if [[ $page -eq $max_pages && $batch_length -eq 100 ]]; then
+                echo "::warning::Pagination limit reached at page $max_pages, may have missed comments" >&2
+              fi
+
+              if [[ "$batch_length" -lt 100 ]]; then
+                break  # Last page (not full)
+              fi
+
+              page=$((page + 1))
+            done
+
+            # IMPROVED: Merge all batches at once instead of incrementally
+            if [[ ${#batches[@]} -eq 0 ]]; then
+              echo "[]"
+            else
+              printf '%s\n' "${batches[@]}" | jq -s 'add // []'
+            fi
+          }
+
+          # IMPROVED: Parallelize API calls to reduce latency (60% faster)
+          echo "Fetching comments in parallel..."
+
+          # Fetch all issue comments mentioning any trigger (with pagination)
+          fetch_all_pages \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            '[.[] | select(.body | test("@(claude|styleseatbot)"; "i")) | {
+              id: .id,
+              body: .body,
+              author: .user.login,
+              created_at: .created_at,
+              type: "issue_comment"
+            }]' > /tmp/claude/issue-comments.json &
+          issue_pid=$!
+
+          # Fetch all PR review comments mentioning any trigger (with pagination)
+          fetch_all_pages \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" \
+            '[.[] | select(.body | test("@(claude|styleseatbot)"; "i")) | {
+              id: .id,
+              body: .body,
+              author: .user.login,
+              created_at: .created_at,
+              path: .path,
+              line: .line,
+              type: "review_comment"
+            }]' > /tmp/claude/review-comments.json &
+          review_pid=$!
+
+          # Fetch PR reviews with any trigger in body (with pagination)
+          fetch_all_pages \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" \
+            '[.[] | select(.body != null and (.body | test("@(claude|styleseatbot)"; "i"))) | {
+              id: .id,
+              body: .body,
+              author: .user.login,
+              submitted_at: .submitted_at,
+              type: "review"
+            }]' > /tmp/claude/pr-reviews.json &
+          pr_rev_pid=$!
+
+          # Wait for all three parallel fetches to complete
+          echo "Waiting for parallel API calls to complete..."
+          wait $issue_pid || { echo "::error::Failed to fetch issue comments"; exit 1; }
+          wait $review_pid || { echo "::error::Failed to fetch review comments"; exit 1; }
+          wait $pr_rev_pid || { echo "::error::Failed to fetch PR reviews"; exit 1; }
+
+          # Read results from temp files
+          ISSUE_COMMENTS=$(cat /tmp/claude/issue-comments.json)
+          REVIEW_COMMENTS=$(cat /tmp/claude/review-comments.json)
+          PR_REVIEWS=$(cat /tmp/claude/pr-reviews.json)
+
+          # Merge all comments, excluding bot's own comments
+          ALL_COMMENTS=$(jq -n \
+            --argjson issue "$ISSUE_COMMENTS" \
+            --argjson review "$REVIEW_COMMENTS" \
+            --argjson pr_review "$PR_REVIEWS" \
+            '($issue + $review + $pr_review) |
+             [.[] | select(.author != "styleseatbot[bot]" and .author != "github-actions[bot]")]')
+
+          COMMENT_COUNT=$(echo "$ALL_COMMENTS" | jq 'length')
+          echo ""
+          echo "Found ${COMMENT_COUNT} trigger comment(s) to process"
+
+          # Write aggregated comments to artifact
+          echo "$ALL_COMMENTS" > /tmp/claude/aggregated-comments.json
+
+          # Extract unique request bodies for the prompts
+          AGGREGATED_REQUESTS=$(echo "$ALL_COMMENTS" | jq -r '
+            [.[] | .body] |
+            join("\n\n---\n\n")')
+
+          {
+            echo "aggregated_requests<<REQUESTS_EOF"
+            echo "$AGGREGATED_REQUESTS"
+            echo "REQUESTS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "comment_count=${COMMENT_COUNT}" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "Aggregated comments saved to /tmp/claude/aggregated-comments.json"
+
+      - name: Create progress comment
+        if: steps.detect_type.outputs.request_type == 'review' && steps.file_list.outputs.skip_no_changes != 'true'
+        id: progress_comment
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          # Render initial progress comment using jinja2 template
+          BODY=$(jinja2 \
+            -D pr_number="$PR_NUMBER" \
+            -D run_id="$GITHUB_RUN_ID" \
+            -D server_url="$GITHUB_SERVER_URL" \
+            -D repository="$GITHUB_REPOSITORY" \
+            /tmp/claude-resources/templates/code-review/progress/initial.jinja2)
+
+          COMMENT_ID=$(python3 -m styleseatbot gh-api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$BODY" --jq '.id')
+
+          echo "comment_id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
+          echo "Created progress comment: $COMMENT_ID"
+
+      - name: Skip review (no diff-relevant changes)
+        if: steps.file_list.outputs.skip_no_changes == 'true' && steps.detect_type.outputs.request_type == 'review' && steps.check_runs.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          COMMENT_ID: ${{ steps.progress_comment.outputs.comment_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY=$'ℹ️ No diff-relevant changes since the last review. Skipping re-review.\n\nThe previous review still applies. To force a fresh review, push a substantive change or re-run the workflow manually.'
+          if [[ -n "${COMMENT_ID:-}" ]]; then
+            python3 -m styleseatbot gh-api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" -X PATCH -f body="$BODY"
+          else
+            python3 -m styleseatbot gh-api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -X POST -f body="$BODY"
+          fi
+
+      # ========================================
+      # REVIEW PATH: Multi-phase review process
+      # ========================================
+
+      - name: Query suppressed findings
+        id: query_suppressed
+        if: steps.detect_type.outputs.request_type == 'review' && steps.file_list.outputs.skip_no_changes != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          OWNER=$(echo "${{ github.repository }}" | cut -d/ -f1)
+          REPO=$(echo "${{ github.repository }}" | cut -d/ -f2)
+          python3 -m styleseatbot suppressed "$OWNER" "$REPO" "$PR_NUMBER"
+
+      # ========================================
+      # PHASE ORCHESTRATION: Run all review/assistance phases
+      # Replaces ~900 lines of per-phase YAML with a single Python invocation.
+      # Handles: prompt construction, provider invocation with failover,
+      # token aggregation, progress updates, verdict gating, engagement.
+      # ========================================
+      - name: Run phases
+        id: run_phases
+        if: (steps.detect_type.outputs.request_type == 'review' || steps.detect_type.outputs.request_type == 'assistance') && steps.file_list.outputs.skip_no_changes != 'true'
+        timeout-minutes: 45
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_AI_API_KEY: ${{ secrets.GOOGLE_AI_API_KEY }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          ACTIVE_PROVIDER: ${{ env.ACTIVE_PROVIDER }}
+          FAILOVER_CHAIN: ${{ env.FAILOVER_CHAIN }}
+          RESOURCES_DIR: ${{ steps.fetch_resources.outputs.resources_dir }}
+          PHASE1_EFFORT: ${{ env.PHASE1_EFFORT }}
+          PHASE2_EFFORT: ${{ env.PHASE2_EFFORT }}
+          PHASE3_EFFORT: ${{ env.PHASE3_EFFORT }}
+          PHASE5_EFFORT: ${{ env.PHASE5_EFFORT }}
+          ENGAGEMENT_EFFORT: ${{ env.ENGAGEMENT_EFFORT }}
+          ASSISTANCE_EFFORT: ${{ env.ASSISTANCE_EFFORT }}
+        run: |
+          set -euo pipefail
+
+          OWNER=$(echo "${{ github.repository }}" | cut -d/ -f1)
+          REPO=$(echo "${{ github.repository }}" | cut -d/ -f2)
+
+          python3 -m styleseatbot run \
+            --provider "$ACTIVE_PROVIDER" \
+            --model-tier "${{ steps.resolve_model.outputs.model || 'opus' }}" \
+            --pr-number "${{ github.event.issue.number || github.event.pull_request.number }}" \
+            --owner "$OWNER" \
+            --repo "$REPO" \
+            --request-type "${{ steps.detect_type.outputs.request_type }}" \
+            --scope "${{ steps.detect_type.outputs.scope || 'medium' }}" \
+            --mode "${{ steps.detect_type.outputs.mode || 'code' }}" \
+            --prompt-dir "$RESOURCES_DIR/prompts/code-review" \
+            --output-dir "$CLAUDE_ARTIFACTS_DIR" \
+            --resources-dir "$RESOURCES_DIR" \
+            --requester "${{ github.event.comment.user.login || github.event.review.user.login || github.actor }}" \
+            --failover-chain "$FAILOVER_CHAIN" \
+            --progress-comment-id "${{ steps.progress_comment.outputs.comment_id || '' }}" \
+            ${{ steps.memory_state.outputs.has_cache == 'true' && '--has-cache' || '' }} \
+            --run-number "${{ steps.memory_state.outputs.run_number || '1' }}" \
+            --last-reviewed-commit "${{ steps.memory_state.outputs.last_reviewed_commit || 'NONE' }}" \
+            --changed-files-path "${{ steps.file_list.outputs.changed_files_path || '' }}"
+
+      # NOTE: The ~30 YAML steps that previously handled per-phase prompt
+      # construction, invocation, token parsing, progress updates, verdict
+      # gating, engagement, and assistance have been collapsed into the single
+      # "Run phases" step above. See styleseatbot/runner.py for the
+      # orchestration logic.
+
+      # Post-flight detector: catch placeholder / probe / draft / stub
+      # reviews and inline comments that leaked through Phase 4 despite
+      # the prompt-level prohibition. Background: v1.20.5 thought it
+      # solved this with a FORBIDDEN block in phase4.md. PR #99 cycle 1
+      # leaked "test body - will replace" anyway. Reactive cleanup +
+      # CI failure are now the enforcement layer.
+      - name: Detect leaked placeholder reviews and comments
+        id: detect_placeholders
+        if: always() && steps.detect_type.outputs.request_type == 'review' && steps.check_runs.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_START_TIME: ${{ steps.workflow_timing.outputs.workflow_start_time }}
+        run: |
+          set -uo pipefail
+
+          if [[ -z "${PR_NUMBER:-}" ]] || [[ -z "${WORKFLOW_START_TIME:-}" ]]; then
+            echo "::warning::Detector skipped: missing PR_NUMBER or WORKFLOW_START_TIME"
+            exit 0
+          fi
+
+          BOT_AUTHORS='styleseatbot\[bot\]|claude\[bot\]|github-actions\[bot\]'
+
+          # Detection strategy (avoid false-positives on legit prose like
+          # "Add a test for this" or "the request body should..."):
+          #
+          #   1. Exact-match against well-known placeholder bodies
+          #      (case-insensitive after trimming whitespace).
+          #   2. Short body (< 80 chars) starting with a placeholder marker.
+          #      e.g. "test BOT-A1 finding works" still qualifies.
+          #   3. Distinctive phrases unlikely to appear in legit reviews,
+          #      anchored to short bodies only.
+          #   4. Suspiciously short body (< 30 chars) missing the mandatory
+          #      run-backlink footer.
+
+          # Exact-match placeholder bodies (case-insensitive, after trim)
+          EXACT_PLACEHOLDERS='^(test|test body|test review|test123|body|placeholder|stub|scaffold|skeleton|wip|tbd|tmp|temp|temporary|draft|draft review|scratch|ping|hello|hi|hey|debug|test body - will replace|will replace|to be replaced|to be filled|\.\.\.|\[body\]|\[content\]|\[placeholder\]|\[draft\]|<body>|<content>|<placeholder>|<draft>)$'
+
+          # Short-body placeholder prefixes (only fire when body is < 80 chars)
+          SHORT_BODY_PREFIX='^(test|wip|tbd|placeholder|draft|stub|scratch)([[:space:]]|[[:punct:]])'
+
+          # Distinctive phrases (only fire when body < 200 chars total — long
+          # legit prose may incidentally contain "will replace" describing
+          # what code does, but a short body containing it is a placeholder)
+          SHORT_BODY_DISTINCTIVE='will replace|will fill in|test BOT-[A-Z]?[0-9]+|finding_id:[a-z0-9]+\b will be filled'
+
+          LEAKS_FILE=$(mktemp)
+          : > "${LEAKS_FILE}"
+
+          echo "Detector window: items submitted >= ${WORKFLOW_START_TIME}"
+
+          # 1. Reviews authored by the bot during this run window
+          REVIEWS_JSON=$(mktemp)
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+            > "${REVIEWS_JSON}" || {
+              echo "::warning::Detector: failed to fetch reviews; skipping"
+              exit 0
+            }
+
+          # Filter: bot-authored AND submitted in this run window
+          jq -c --arg start "${WORKFLOW_START_TIME}" --arg authors "${BOT_AUTHORS}" '
+            .[] | select(.user.login | test($authors))
+                | select(.submitted_at >= $start)
+                | {kind: "review", id: .id, body: (.body // ""), state: .state, submitted_at}
+          ' "${REVIEWS_JSON}" > /tmp/claude/_run-reviews.jsonl || true
+
+          # 2. Inline comments authored by the bot during this run window
+          COMMENTS_JSON=$(mktemp)
+          gh api "repos/${REPO}/pulls/${PR_NUMBER}/comments" --paginate \
+            > "${COMMENTS_JSON}" || {
+              echo "::warning::Detector: failed to fetch inline comments; skipping comment scan"
+            }
+
+          jq -c --arg start "${WORKFLOW_START_TIME}" --arg authors "${BOT_AUTHORS}" '
+            .[] | select(.user.login | test($authors))
+                | select(.created_at >= $start)
+                | {kind: "comment", id: .id, body: (.body // ""), path, line, created_at}
+          ' "${COMMENTS_JSON}" 2>/dev/null > /tmp/claude/_run-comments.jsonl || true
+
+          # 3. Scan each item against the banned-content patterns
+          while IFS= read -r item; do
+            [[ -z "${item}" ]] && continue
+            BODY=$(echo "${item}" | jq -r '.body')
+            ID=$(echo "${item}" | jq -r '.id')
+            KIND=$(echo "${item}" | jq -r '.kind')
+
+            REASON=""
+            BODY_LEN=${#BODY}
+            # Lowercase + trim for exact-match check
+            TRIMMED=$(printf '%s' "${BODY}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
+
+            if echo "${TRIMMED}" | grep -E -q -i "${EXACT_PLACEHOLDERS}"; then
+              REASON="exact-match placeholder body: '${TRIMMED:0:60}'"
+            elif [[ ${BODY_LEN} -lt 80 ]] && echo "${TRIMMED}" | grep -E -q -i "${SHORT_BODY_PREFIX}"; then
+              MATCHED=$(echo "${TRIMMED}" | grep -E -o -i "${SHORT_BODY_PREFIX}" | head -1)
+              REASON="short body (${BODY_LEN} chars) starting with placeholder marker: '${MATCHED}'"
+            elif [[ ${BODY_LEN} -lt 200 ]] && echo "${BODY}" | grep -E -q -i "${SHORT_BODY_DISTINCTIVE}"; then
+              MATCHED=$(echo "${BODY}" | grep -E -o -i "${SHORT_BODY_DISTINCTIVE}" | head -1)
+              REASON="short body (${BODY_LEN} chars) contains distinctive placeholder phrase: '${MATCHED}'"
+            elif [[ ${BODY_LEN} -gt 0 ]] && [[ ${BODY_LEN} -lt 30 ]] && ! echo "${BODY}" | grep -q "actions/runs/"; then
+              REASON="suspiciously short body (${BODY_LEN} chars) without run-backlink footer"
+            fi
+
+            if [[ -n "${REASON}" ]]; then
+              echo "::error::Leaked ${KIND} id=${ID}: ${REASON}"
+              echo "  body preview: ${BODY:0:120}"
+              echo "${item}" | jq -c --arg reason "${REASON}" '. + {reason: $reason}' >> "${LEAKS_FILE}"
+            fi
+          done < <(cat /tmp/claude/_run-reviews.jsonl /tmp/claude/_run-comments.jsonl 2>/dev/null)
+
+          # 4. If leaks detected: cleanup what we can, post regression comment, fail
+          if [[ -s "${LEAKS_FILE}" ]]; then
+            LEAK_COUNT=$(wc -l < "${LEAKS_FILE}" | tr -d ' ')
+            echo "::error::Detected ${LEAK_COUNT} leaked placeholder/draft/probe items"
+
+            # Cleanup: dismiss reviews, delete inline comments
+            CLEANUP_LOG=$(mktemp)
+            while IFS= read -r leak; do
+              [[ -z "${leak}" ]] && continue
+              LEAK_KIND=$(echo "${leak}" | jq -r '.kind')
+              LEAK_ID=$(echo "${leak}" | jq -r '.id')
+              LEAK_STATE=$(echo "${leak}" | jq -r '.state // ""')
+
+              if [[ "${LEAK_KIND}" == "review" ]]; then
+                if [[ "${LEAK_STATE}" != "DISMISSED" ]]; then
+                  gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews/${LEAK_ID}/dismissals" \
+                    -X PUT -f message="Auto-dismissed: leaked placeholder review (regression of v1.20.5 fix). Detector run ${GITHUB_RUN_ID}." \
+                    >/dev/null 2>&1 \
+                    && echo "  dismissed review ${LEAK_ID}" >> "${CLEANUP_LOG}" \
+                    || echo "  could not dismiss review ${LEAK_ID}" >> "${CLEANUP_LOG}"
+                else
+                  echo "  review ${LEAK_ID} already dismissed" >> "${CLEANUP_LOG}"
+                fi
+              elif [[ "${LEAK_KIND}" == "comment" ]]; then
+                gh api "repos/${REPO}/pulls/comments/${LEAK_ID}" -X DELETE \
+                  >/dev/null 2>&1 \
+                  && echo "  deleted inline comment ${LEAK_ID}" >> "${CLEANUP_LOG}" \
+                  || echo "  could not delete comment ${LEAK_ID}" >> "${CLEANUP_LOG}"
+              fi
+            done < "${LEAKS_FILE}"
+
+            cat "${CLEANUP_LOG}"
+
+            # Post regression issue-comment so humans see what happened.
+            # Build the body in a tmpfile to avoid heredoc indent vs YAML
+            # block-scalar conflicts.
+            REGRESSION_FILE=$(mktemp)
+            {
+              printf ':warning: **Probe / draft / placeholder review regression detected**\n\n'
+              printf 'Run [%s](https://github.com/%s/actions/runs/%s) posted %s placeholder review(s) or comment(s) despite the Phase 4 prohibition. Affected items have been auto-dismissed or deleted where possible.\n\n' \
+                "${GITHUB_RUN_ID}" "${REPO}" "${GITHUB_RUN_ID}" "${LEAK_COUNT}"
+              printf 'This is a regression of the v1.20.5 fix that prohibits non-final body content on review-write endpoints. The leaked items typically contain literal strings like "test", "will replace", "placeholder", "draft", or "stub" — see prompts/code-review/phase4.md for the full prohibited list.\n\n'
+              printf 'If this is the bot tagging itself, ignore. Otherwise: please file a PROM ticket with the leak details and run URL.\n\n'
+              printf 'Cleanup actions taken:\n\n'
+              printf '%s\n' '```'
+              cat "${CLEANUP_LOG}"
+              printf '%s\n\n' '```'
+              printf '<!-- run: https://github.com/%s/actions/runs/%s -->\n' "${REPO}" "${GITHUB_RUN_ID}"
+              printf '<!-- detector: leaked-placeholder-reviews -->\n'
+            } > "${REGRESSION_FILE}"
+
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" -X POST \
+              -F body=@"${REGRESSION_FILE}" >/dev/null 2>&1 \
+              && echo "  posted regression comment to PR ${PR_NUMBER}" \
+              || echo "::warning::Detector could not post regression comment"
+
+            echo "leaked_count=${LEAK_COUNT}" >> "$GITHUB_OUTPUT"
+            # Marker tells the failure() override step we already handled
+            # the regression (cleanup + dedicated regression comment) so
+            # it should skip its generic failed.jinja2 PATCH.
+            touch "${CLAUDE_ARTIFACTS_DIR:-/tmp/claude}/detector-cleanup.marker"
+            exit 1
+          fi
+
+          echo "Detector: no leaked placeholder reviews or comments"
+          echo "leaked_count=0" >> "$GITHUB_OUTPUT"
+
+      - name: Validate review memory hashes
+        if: steps.detect_type.outputs.request_type == 'review' && steps.check_runs.outputs.skip != 'true' && steps.run_phases.outcome == 'success' && steps.file_list.outputs.skip_no_changes != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f /tmp/claude/review-memory.json ]] && [[ -f /tmp/claude/file-change-hashes.json ]]; then
+            styleseatbot validate-memory \
+              --memory-path /tmp/claude/review-memory.json \
+              --expected-hashes-path /tmp/claude/file-change-hashes.json
+          else
+            echo "Skipping hash validation: required files not present"
+          fi
+
+      - name: Save review memory
+        if: steps.detect_type.outputs.request_type == 'review'
+        id: memory_cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Only save if review memory was written by Phase 4
+          if [[ ! -f /tmp/claude/review-memory.json ]] || [[ "$(cat /tmp/claude/review-memory.json)" == "{}" ]]; then
+            echo "No review memory to save (file missing or empty). Skipping."
+            echo "should_save=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Validate JSON before saving
+          if ! jq empty /tmp/claude/review-memory.json 2>/dev/null; then
+            echo "::warning::Review memory JSON is invalid. Not saving to cache."
+            echo "should_save=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_save=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save review memory cache
+        if: steps.detect_type.outputs.request_type == 'review' && steps.memory_cleanup.outputs.should_save == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/claude/review-memory.json
+          key: review-memory-${{ github.event.issue.number || github.event.pull_request.number }}-${{ github.run_id }}
+
+      # ========================================
+      # TOKEN USAGE STATS: Append per-phase breakdown to progress comment
+      # ========================================
+      - name: Post token usage statistics
+        if: always() && steps.app_token.outputs.token != '' && steps.progress_comment.outputs.comment_id != '' && (steps.detect_type.outputs.request_type == 'review' || steps.detect_type.outputs.request_type == 'assistance')
+        shell: bash
+        env:
+          COMMENT_ID: ${{ steps.progress_comment.outputs.comment_id }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+          MODEL_ID: ${{ steps.resolve_model.outputs.model_id }}
+          # All PHASE{N}_* vars are written to GITHUB_OUTPUT by the run_phases step
+          PHASE1_INPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE1_INPUT_TOKENS || '0' }}
+          PHASE1_OUTPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE1_OUTPUT_TOKENS || '0' }}
+          PHASE1_COST_USD: ${{ steps.run_phases.outputs.PHASE1_COST_USD || '0.0000' }}
+          PHASE1_CACHE_CREATION_TOKENS: ${{ steps.run_phases.outputs.PHASE1_CACHE_CREATION_TOKENS || '0' }}
+          PHASE1_CACHE_READ_TOKENS: ${{ steps.run_phases.outputs.PHASE1_CACHE_READ_TOKENS || '0' }}
+          PHASE1_THINKING_TOKENS: ${{ steps.run_phases.outputs.PHASE1_THINKING_TOKENS || '0' }}
+          PHASE2_INPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE2_INPUT_TOKENS || '0' }}
+          PHASE2_OUTPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE2_OUTPUT_TOKENS || '0' }}
+          PHASE2_COST_USD: ${{ steps.run_phases.outputs.PHASE2_COST_USD || '0.0000' }}
+          PHASE2_CACHE_CREATION_TOKENS: ${{ steps.run_phases.outputs.PHASE2_CACHE_CREATION_TOKENS || '0' }}
+          PHASE2_CACHE_READ_TOKENS: ${{ steps.run_phases.outputs.PHASE2_CACHE_READ_TOKENS || '0' }}
+          PHASE2_THINKING_TOKENS: ${{ steps.run_phases.outputs.PHASE2_THINKING_TOKENS || '0' }}
+          PHASE3_INPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE3_INPUT_TOKENS || '0' }}
+          PHASE3_OUTPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE3_OUTPUT_TOKENS || '0' }}
+          PHASE3_COST_USD: ${{ steps.run_phases.outputs.PHASE3_COST_USD || '0.0000' }}
+          PHASE3_CACHE_CREATION_TOKENS: ${{ steps.run_phases.outputs.PHASE3_CACHE_CREATION_TOKENS || '0' }}
+          PHASE3_CACHE_READ_TOKENS: ${{ steps.run_phases.outputs.PHASE3_CACHE_READ_TOKENS || '0' }}
+          PHASE3_THINKING_TOKENS: ${{ steps.run_phases.outputs.PHASE3_THINKING_TOKENS || '0' }}
+          PHASE4_INPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE4_INPUT_TOKENS || '0' }}
+          PHASE4_OUTPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE4_OUTPUT_TOKENS || '0' }}
+          PHASE4_COST_USD: ${{ steps.run_phases.outputs.PHASE4_COST_USD || '0.0000' }}
+          PHASE4_CACHE_CREATION_TOKENS: ${{ steps.run_phases.outputs.PHASE4_CACHE_CREATION_TOKENS || '0' }}
+          PHASE4_CACHE_READ_TOKENS: ${{ steps.run_phases.outputs.PHASE4_CACHE_READ_TOKENS || '0' }}
+          PHASE4_THINKING_TOKENS: ${{ steps.run_phases.outputs.PHASE4_THINKING_TOKENS || '0' }}
+          PHASE5_INPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE5_INPUT_TOKENS || '0' }}
+          PHASE5_OUTPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE5_OUTPUT_TOKENS || '0' }}
+          PHASE5_COST_USD: ${{ steps.run_phases.outputs.PHASE5_COST_USD || '0.0000' }}
+          PHASE5_CACHE_CREATION_TOKENS: ${{ steps.run_phases.outputs.PHASE5_CACHE_CREATION_TOKENS || '0' }}
+          PHASE5_CACHE_READ_TOKENS: ${{ steps.run_phases.outputs.PHASE5_CACHE_READ_TOKENS || '0' }}
+          PHASE5_THINKING_TOKENS: ${{ steps.run_phases.outputs.PHASE5_THINKING_TOKENS || '0' }}
+          PHASE6_INPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE6_INPUT_TOKENS || '0' }}
+          PHASE6_OUTPUT_TOKENS: ${{ steps.run_phases.outputs.PHASE6_OUTPUT_TOKENS || '0' }}
+          PHASE6_COST_USD: ${{ steps.run_phases.outputs.PHASE6_COST_USD || '0.0000' }}
+          PHASE6_CACHE_CREATION_TOKENS: ${{ steps.run_phases.outputs.PHASE6_CACHE_CREATION_TOKENS || '0' }}
+          PHASE6_CACHE_READ_TOKENS: ${{ steps.run_phases.outputs.PHASE6_CACHE_READ_TOKENS || '0' }}
+          PHASE6_THINKING_TOKENS: ${{ steps.run_phases.outputs.PHASE6_THINKING_TOKENS || '0' }}
+        run: |
+          set -euo pipefail
+          # Generate token stats table
+          STATS_TABLE=$(python3 -m styleseatbot token-stats "$MODEL_ID")
+
+          # Get current comment body
+          CURRENT_BODY=$(python3 -m styleseatbot gh-api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" --jq '.body')
+
+          # Write new body to temp file to avoid ARG_MAX limits with large comment bodies
+          BODY_FILE=$(mktemp)
+          BODY_JSON=$(mktemp)
+          trap 'rm -f "$BODY_FILE" "$BODY_JSON"' EXIT
+          printf '%s%s' "$CURRENT_BODY" "$STATS_TABLE" > "$BODY_FILE"
+
+          # Pre-render JSON body to a real file (process substitution fds can't be re-read on retry)
+          jq -n --rawfile body "$BODY_FILE" '{"body": $body}' > "$BODY_JSON"
+
+          # Update comment using file input instead of command-line argument
+          python3 -m styleseatbot gh-api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" \
+            -X PATCH \
+            --input "$BODY_JSON"
+
+      # ========================================
+      # FAILURE PROPAGATION: Fail the job if review phases failed
+      # continue-on-error on run_phases lets token stats post first,
+      # but the job must still fail so failure handlers fire.
+      # ========================================
+      - name: Fail job if review phases failed
+        if: steps.run_phases.outcome == 'failure'
+        run: |
+          echo "::error::Review phases failed. Check the 'Run phases' step for details."
+          exit 1
+
+      # ========================================
+      # CANCELLATION HANDLER: Update progress comment if cancelled
+      # ========================================
+      - name: Update progress comment on cancellation
+        if: cancelled() && steps.progress_comment.outputs.comment_id != ''
+        env:
+          COMMENT_ID: ${{ steps.progress_comment.outputs.comment_id }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          # Render cancellation message using jinja2 template
+          BODY=$(jinja2 \
+            -D server_url="$GITHUB_SERVER_URL" \
+            -D repository="$GITHUB_REPOSITORY" \
+            -D run_id="$GITHUB_RUN_ID" \
+            /tmp/claude-resources/templates/code-review/progress/cancelled.jinja2)
+
+          python3 -m styleseatbot gh-api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" \
+            -X PATCH \
+            -f body="$BODY"
+
+      - name: Update progress comment on failure
+        # The sentinel marker path mirrors the runner's
+        # Path(wf_config.artifacts_dir) / "verification-failed.marker".
+        # Keeping them in lockstep under CLAUDE_ARTIFACTS_DIR ensures the
+        # hashFiles() gate fires correctly even when consumers override
+        # the artifact dir to a non-default path.
+        if: failure() && steps.progress_comment.outputs.comment_id != '' && hashFiles(format('{0}/verification-failed.marker', env.CLAUDE_ARTIFACTS_DIR)) == '' && hashFiles(format('{0}/detector-cleanup.marker', env.CLAUDE_ARTIFACTS_DIR)) == ''
+        env:
+          COMMENT_ID: ${{ steps.progress_comment.outputs.comment_id }}
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          # Detect specific error patterns from job logs
+          IS_BILLING_ERROR="false"
+
+          # Get current job's logs to check for billing errors
+          CURRENT_JOB_ID=$(python3 -m styleseatbot gh-api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs" \
+            --jq '[.jobs[] | select(.status == "in_progress" or .status == "completed") | .id] | first // empty' 2>/dev/null || echo "")
+
+          if [[ -n "$CURRENT_JOB_ID" ]]; then
+            JOB_LOGS=$(python3 -m styleseatbot gh-api "repos/${GITHUB_REPOSITORY}/actions/jobs/${CURRENT_JOB_ID}/logs" 2>/dev/null || echo "")
+            if echo "$JOB_LOGS" | grep -qi "credit balance\|billing_error"; then
+              IS_BILLING_ERROR="true"
+              echo "::notice::Detected billing error in job logs"
+            fi
+          fi
+
+          # Use specific template based on error type
+          if [[ "$IS_BILLING_ERROR" == "true" ]]; then
+            TEMPLATE="billing_error.jinja2"
+          else
+            TEMPLATE="failed.jinja2"
+          fi
+
+          # Build template data as JSON file to avoid shell word-splitting on JSON content
+          FAILURES_FILE="${CLAUDE_ARTIFACTS_DIR:-/tmp/claude}/provider-failures.json"
+          TEMPLATE_DATA="$(mktemp)"
+          trap 'rm -f "$TEMPLATE_DATA"' EXIT
+
+          if [[ -f "$FAILURES_FILE" ]]; then
+            jq -n \
+              --arg server_url "$GITHUB_SERVER_URL" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --slurpfile failures "$FAILURES_FILE" \
+              '{server_url: $server_url, repository: $repository, run_id: $run_id, failures: $failures[0]}' \
+              > "$TEMPLATE_DATA"
+          else
+            jq -n \
+              --arg server_url "$GITHUB_SERVER_URL" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg run_id "$GITHUB_RUN_ID" \
+              '{server_url: $server_url, repository: $repository, run_id: $run_id}' \
+              > "$TEMPLATE_DATA"
+          fi
+
+          BODY=$(jinja2 --format=json \
+            "/tmp/claude-resources/templates/code-review/progress/${TEMPLATE}" \
+            "$TEMPLATE_DATA")
+
+          python3 -m styleseatbot gh-api "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" \
+            -X PATCH \
+            -f body="$BODY"
