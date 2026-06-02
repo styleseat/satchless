@@ -1,4 +1,3 @@
-from __future__ import absolute_import
 from django.db.models import Sum, Min, Max
 
 from satchless.contrib.pricing.simpleqty import models

@@ -1,10 +1,9 @@
-from __future__ import absolute_import
 import datetime
 import decimal
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 import random
 
 from ..pricing import Price
@@ -12,8 +11,6 @@ from ..product.models import Variant
 from ..util import countries
 from . import signals
 from .exceptions import EmptyCart
-import six
-from six.moves import range
 
 class OrderManager(models.Manager):
 
@@ -143,7 +140,7 @@ class Order(models.Model):
     def create_ordered_item(self, delivery_group, item):
         price = item.get_unit_price()
         variant = item.variant.get_subtype_instance()
-        name = six.text_type(variant)
+        name = str(variant)
         ordered_item_class = self.get_ordered_item_class()
         ordered_item = ordered_item_class(delivery_group=delivery_group,
                                           product_variant=item.variant,

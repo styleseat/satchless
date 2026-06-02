@@ -1,8 +1,4 @@
-from __future__ import absolute_import
-import os
-import six
 
-from django.conf.urls import include, url
 from django.test import TestCase
 
 from ...product.tests import DeadParrot
@@ -21,4 +17,4 @@ class Models(TestCase):
                                                parent=self.birds)
 
     def test_str(self):
-        self.assertEqual(six.text_type(self.animals), u'Animals')
+        self.assertEqual(str(self.animals), u'Animals')

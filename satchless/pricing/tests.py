@@ -1,4 +1,3 @@
-from __future__ import absolute_import
 import decimal
 
 from django.test import TestCase

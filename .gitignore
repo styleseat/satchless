@@ -1,5 +1,6 @@
 .*
 !.github
+!.circleci
 !.gitignore
 !.coveragerc
 *.py[co]
